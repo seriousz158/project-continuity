@@ -1,0 +1,16 @@
+{
+  "project": {
+    "goal": "Ship a verified parser",
+    "next_step": "Run the malformed-input regression suite"
+  },
+  "tasks": [
+    {
+      "id": "parser-tests",
+      "title": "Add parser regression coverage",
+      "status": "doing",
+      "owner": "agent-a",
+      "depends_on": [],
+      "acceptance": ["Malformed input is rejected"]
+    }
+  ]
+}
