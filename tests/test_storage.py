@@ -58,7 +58,7 @@ class StorageTests(unittest.TestCase):
 
     def test_symlink_and_hardlink_rejected(self):
         target = self.root / "target"
-        target.write_text("unchanged")
+        target.write_text("unchanged", encoding="utf-8")
         alias = self.root / "alias"
         alias.symlink_to(target)
         for action in (lambda: storage.child(self.root, "alias"), lambda: storage.read(alias), lambda: storage.atomic(alias, "bad")):
@@ -69,12 +69,12 @@ class StorageTests(unittest.TestCase):
         for action in (lambda: storage.child(self.root, "hard"), lambda: storage.read(hard), lambda: storage.atomic(hard, "bad")):
             with self.assertRaises(storage.Error):
                 action()
-        self.assertEqual(target.read_text(), "unchanged")
+        self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
 
     def test_linked_ancestor_is_rejected(self):
         directory = self.root / "real"
         directory.mkdir()
-        (directory / "file").write_text("data")
+        (directory / "file").write_text("data", encoding="utf-8")
         (self.root / "alias").symlink_to(directory, target_is_directory=True)
         with self.assertRaises(storage.Error):
             storage.child(self.root, "alias", "file")
@@ -86,7 +86,7 @@ class StorageTests(unittest.TestCase):
     def test_utf8_newlines_limits_and_regular_file_requirement(self):
         path = self.root / "file"
         value = "你好\r\nline\n"
-        self.assertEqual(storage.atomic(path, value), [])
+        self.assertEqual(bool(storage.atomic(path, value)), os.name == "nt")
         self.assertEqual(storage.read(path), value)
         self.assertEqual(path.read_bytes(), value.encode())
         self.assertEqual(storage.read(path, len(value.encode())), value)
@@ -111,9 +111,9 @@ class StorageTests(unittest.TestCase):
 
     def test_read_detects_replacement_between_check_and_open(self):
         path = self.root / "file"
-        path.write_text("first")
+        path.write_text("first", encoding="utf-8")
         replacement = self.root / "replacement"
-        replacement.write_text("second")
+        replacement.write_text("second", encoding="utf-8")
         original = os.open
         fired = False
 
@@ -130,11 +130,11 @@ class StorageTests(unittest.TestCase):
 
     def test_atomic_file_sync_failure_is_precommit(self):
         path = self.root / "CURRENT.md"
-        path.write_text("old")
+        path.write_text("old", encoding="utf-8")
         with mock.patch.object(storage.os, "fsync", side_effect=OSError("injected file fsync failure")):
             with self.assertRaises(storage.Error):
                 storage.atomic(path, "new")
-        self.assertEqual(path.read_text(), "old")
+        self.assertEqual(path.read_text(encoding="utf-8"), "old")
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["CURRENT.md"])
 
     def test_reparse_attributes_rejected_even_without_symlink_mode(self):
@@ -148,9 +148,9 @@ class StorageTests(unittest.TestCase):
     def test_lock_detects_inode_replacement_after_acquisition(self):
         import fcntl
         path = self.root / "lock"
-        path.write_text("")
+        path.write_text("", encoding="utf-8")
         replacement = self.root / "replacement"
-        replacement.write_text("")
+        replacement.write_text("", encoding="utf-8")
         original = fcntl.flock
 
         def swapped(fd, operation):
@@ -165,11 +165,11 @@ class StorageTests(unittest.TestCase):
 
     def test_atomic_precommit_failure_preserves_current_and_cleans_temp(self):
         path = self.root / "CURRENT.md"
-        path.write_text("old")
+        path.write_text("old", encoding="utf-8")
         with mock.patch.object(storage.os, "replace", side_effect=OSError("injected replacement failure")):
             with self.assertRaises(storage.Error):
                 storage.atomic(path, "new")
-        self.assertEqual(path.read_text(), "old")
+        self.assertEqual(path.read_text(encoding="utf-8"), "old")
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["CURRENT.md"])
 
     def test_atomic_postcommit_parent_sync_failure_is_warning(self):
@@ -186,13 +186,13 @@ class StorageTests(unittest.TestCase):
 
         with mock.patch.object(storage.os, "fsync", side_effect=fsync):
             warnings = storage.atomic(path, "committed")
-        self.assertEqual(path.read_text(), "committed")
+        self.assertEqual(path.read_text(encoding="utf-8"), "committed")
         self.assertTrue(warnings)
         self.assertIn("durability", warnings[0])
 
     def test_commit_snapshots_old_first_and_retries(self):
         current = self.root / "CURRENT.md"
-        current.write_text("old\r\n", newline="")
+        current.write_text("old\r\n", newline="", encoding="utf-8")
         history = self.root / "history"
         original = storage.atomic
 
@@ -210,26 +210,26 @@ class StorageTests(unittest.TestCase):
         result = storage.commit(current, history, "old\r\n", "new", 3)
         self.assertEqual(storage.read(current), "new")
         self.assertEqual(result["history"], str(history / name))
-        self.assertEqual(result["warnings"], [])
+        self.assertEqual(bool(result["warnings"]), os.name == "nt")
         self.assertEqual(len(list(history.iterdir())), 1)
 
     def test_history_failure_and_mismatch_leave_current_unchanged(self):
         current = self.root / "CURRENT.md"
-        current.write_text("old")
+        current.write_text("old", encoding="utf-8")
         history = self.root / "history"
         with mock.patch.object(storage, "atomic", side_effect=storage.Error("history failure")):
             with self.assertRaises(storage.Error):
                 storage.commit(current, history, "old", "new", 1)
         self.assertEqual(storage.read(current), "old")
         name = f"r1-{hashlib.sha256(b'old').hexdigest()}.md"
-        (history / name).write_text("wrong")
+        (history / name).write_text("wrong", encoding="utf-8")
         with self.assertRaises(storage.Error):
             storage.commit(current, history, "old", "new", 1)
         self.assertEqual(storage.read(current), "old")
 
     def test_commit_rejects_stale_old_text(self):
         current = self.root / "CURRENT.md"
-        current.write_text("actual")
+        current.write_text("actual", encoding="utf-8")
         with self.assertRaises(storage.Error):
             storage.commit(current, self.root / "history", "stale", "new", 1)
         self.assertEqual(storage.read(current), "actual")

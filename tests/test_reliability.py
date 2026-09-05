@@ -32,8 +32,8 @@ class ReliabilityTests(unittest.TestCase):
         return self.call('save','--writer','a','--expected-revision','1','--operation-id','s')
 
     def test_expired_lease_rejected(self):
-        lines, body, meta=cli.split(self.current.read_text())
-        self.current.write_text(cli.metadata(lines,{'lease_until':'2000-01-01T00:00:00Z'})+body)
+        lines, body, meta=cli.split(self.current.read_text(encoding="utf-8"))
+        self.current.write_text(cli.metadata(lines,{'lease_until':'2000-01-01T00:00:00Z'})+body, encoding="utf-8")
         before=self.current.read_bytes()
         self.assertEqual(self.save()[0],2)
         self.assertEqual(self.current.read_bytes(),before)
@@ -81,13 +81,13 @@ class ReliabilityTests(unittest.TestCase):
 
     def test_explicit_recovery_repairs_only_derived_view(self):
         self.assertEqual(self.save()[0], 0)
-        original = self.current.read_text()
-        self.current.write_text(original.replace('## Tasks', '## Tampered display'))
+        original = self.current.read_text(encoding="utf-8")
+        self.current.write_text(original.replace('## Tasks', '## Tampered display'), encoding="utf-8")
         self.assertEqual(self.call('validate')[0], 2)
         code, result = self.call('recover', '--writer', 'b', '--expected-revision', '2',
                                  '--operation-id', 'fix-view', '--reason', 'Regenerate reviewed display')
         self.assertEqual(code, 0)
-        self.assertNotIn('Tampered display', self.current.read_text())
+        self.assertNotIn('Tampered display', self.current.read_text(encoding="utf-8"))
         self.assertNotIn(str(self.root), result['history'])
         self.assertEqual(self.call('validate')[0], 0)
 

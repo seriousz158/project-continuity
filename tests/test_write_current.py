@@ -30,10 +30,14 @@ custom_field: preserve-this
 def run(root, *args, patch=None):
     return subprocess.run([sys.executable, str(SCRIPT), *args, '--root', str(root)],
                           input=json.dumps(patch) if patch is not None else None,
-                          text=True, capture_output=True, timeout=30)
+                          text=True, encoding='utf-8', capture_output=True, timeout=30)
 
 
 class CliTests(unittest.TestCase):
+    def test_unicode_project_roundtrip(self):
+        self.call('init', '--name', '跨平台项目')
+        self.assertEqual(self.call('status')['project']['name'], '跨平台项目')
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -116,14 +120,14 @@ class CliTests(unittest.TestCase):
     def test_v1_migration_is_explicit_and_preserves_unknown(self):
         (self.root/'.relay').mkdir()
         current = self.root/'.relay/CURRENT.md'
-        current.write_text(V1)
+        current.write_text(V1, encoding="utf-8")
         before = current.read_bytes()
         preview = self.call('migrate')
         self.assertEqual(current.read_bytes(), before)
         self.assertEqual(list((self.root/'.relay').iterdir()), [current])
         self.call('resume', '--writer', 'agent:a', '--expected-revision', '7', '--operation-id', 'x', ok=False)
         self.call('migrate', '--apply', '--writer', 'agent:a', '--expected-revision', '7', '--operation-id', 'm1', '--source-sha256', preview['source_sha256'])
-        doc = current.read_text()
+        doc = current.read_text(encoding="utf-8")
         self.assertIn('custom_field: preserve-this', doc)
         self.assertIn('## Project-specific gate\n- NOT_EXECUTED is not completion.', doc)
         self.assertEqual(self.call('status')['schema'], 'project-continuity/v2')
@@ -151,11 +155,11 @@ class CliTests(unittest.TestCase):
     def test_git_same_head_dirty_drift(self):
         subprocess.run(['git','init','-q',str(self.root)],check=True)
         self.call('init')
-        (self.root/'untracked.txt').write_text('first')
+        (self.root/'untracked.txt').write_text('first', encoding="utf-8")
         self.call('resume','--writer','a','--expected-revision','0','--operation-id','r',ok=False)
         self.call('resume','--writer','a','--expected-revision','0','--operation-id','r','--allow-drift')
         before = self.call('status')['git']['fingerprint']
-        (self.root/'untracked.txt').write_text('second')
+        (self.root/'untracked.txt').write_text('second', encoding="utf-8")
         after = self.call('status')
         self.assertNotEqual(before,after['git']['fingerprint'])
         self.assertTrue(after['drift'])

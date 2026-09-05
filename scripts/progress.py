@@ -219,9 +219,13 @@ def view(state):
 
 
 def block(body, start, end):
-    require(body.count(start) == 1 and body.count(end) == 1, "missing or duplicate managed section")
-    a = body.index(start) + len(start)
-    b = body.index(end)
+    def matches(marker):
+        pattern = r'\r?\n'.join(re.escape(line) for line in marker.split('\n'))
+        return list(re.finditer(pattern, body))
+    starts, ends = matches(start), matches(end)
+    require(len(starts) == 1 and len(ends) == 1, "missing or duplicate managed section")
+    a = starts[0].end()
+    b = ends[0].start()
     require(a <= b, "invalid managed section order")
     return a, b
 
@@ -231,7 +235,7 @@ def parse_body(body):
     c, d = block(body, VIEW_START, VIEW_END)
     require(b + len(DATA_END) <= c - len(VIEW_START) or d + len(VIEW_END) <= a - len(DATA_START), "overlapping managed sections")
     state = validate(loads(body[a:b]))
-    return state, body[c:d] == view(state)
+    return state, body[c:d].replace('\r\n', '\n') == view(state)
 
 
 def render_body(state, body=None):

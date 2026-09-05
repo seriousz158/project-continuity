@@ -7,6 +7,16 @@ import progress as p
 
 
 class ProgressTests(unittest.TestCase):
+    def test_crlf_managed_sections_preserve_unknown_bytes(self):
+        state = p.empty_state('项目')
+        prefix = '## Custom\r\nPreserve exactly\r\n'
+        body = prefix + p.render_body(state).replace('\n', '\r\n')
+        self.assertEqual(p.parse_body(body), (state, True))
+        updated = p.apply(state, {'project': {'goal': 'next'}}, {})
+        rendered = p.render_body(updated, body)
+        self.assertTrue(rendered.startswith(prefix))
+        self.assertEqual(p.parse_body(rendered), (updated, True))
+
     def test_roundtrip_extensions(self):
         state = p.empty_state("项目")
         state["extensions"] = {"custom": {"hello": [1, True]}}

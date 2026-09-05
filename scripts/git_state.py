@@ -105,7 +105,11 @@ def capture(root):
                 after = os.fstat(handle.fileno())
                 storage.child(top, os.fsdecode(name), exists=True)
                 final = path.lstat()
-                if seen != before.st_size or (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (before.st_size, before.st_mtime_ns, before.st_ctime_ns) or (final.st_dev, final.st_ino) != (before.st_dev, before.st_ino):
+                # Compare timestamps within the same API: Windows stat/fstat
+                # can expose different creation-time precision.
+                def times(info):
+                    return info.st_size, info.st_mtime_ns, info.st_ctime_ns
+                if seen != before.st_size or times(after) != times(opened) or times(final) != times(before) or (final.st_dev, final.st_ino) != (before.st_dev, before.st_ino):
                     return error('file changed while fingerprinting')
                 fingerprint.update(b'\0')
                 if name in index:
