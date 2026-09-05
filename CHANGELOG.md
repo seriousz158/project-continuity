@@ -2,8 +2,7 @@
 
 ## 0.1.0 - 2026-09-05
 
-First stable release. The tag remains gated on the release commit's complete CI
-matrix, clean-package verification, and publication review.
+First stable release.
 
 - Add the v2 structured JSON state and derived Markdown view.
 - Add explicit init, read-only status/validation, leased writes, revision CAS,

@@ -5,11 +5,21 @@ across coding agents. The v2 format stores authoritative JSON and a derived
 human-readable view in `.relay/CURRENT.md`, protected by revision checks, writer
 leases, operation receipts, local locks, atomic writes, and history snapshots.
 
-**Version:** `0.1.0` release preparation. The repository CI targets macOS,
-Linux, and Windows with Python 3.11, 3.12, and 3.13. The stable tag and release
-are created only after the release commit passes all nine jobs. No claim is made
-that existing projects have migrated or that an active client has hot-reloaded
-an on-disk installation.
+**Version:** `0.1.0`. The release line is tested on macOS, Linux, and Windows
+with Python 3.11, 3.12, and 3.13. The stable tag is created only from a commit
+whose complete nine-job matrix passes. No claim is made that existing projects
+have migrated or that an active client has hot-reloaded an on-disk installation.
+
+## Verification scope
+
+- The source tree and a clean extracted package run the same 52-test suite.
+- GitHub Actions runs that suite and package verification in all nine supported
+  OS/Python combinations.
+- A private isolated complex-project rehearsal exercised authority cutover and
+  found zero migration-added verifier failures; the project's pre-existing
+  failures were retained, and no live cutover was authorized.
+- Client discovery, on-disk installation, active-session loading, and migration
+  of each existing project are separate checks and are never inferred from CI.
 
 ## Why
 
