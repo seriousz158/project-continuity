@@ -246,15 +246,16 @@ from the installed directory.
 
 ## Verification
 
-Version `v0.1.0` was released from a commit whose complete GitHub Actions matrix
-passed. The source tree, a clean remote checkout, the built archive, and a
-re-downloaded release archive each ran the same 52-test suite. A private,
-isolated complex-project rehearsal preserved the full verifier result with zero
-migration-added failures; it did not authorize a live project cutover.
+Version `v0.1.1` packages this README redesign without changing CLI or
+`project-continuity/v2` protocol behavior. It is released only after the full
+GitHub Actions matrix, a clean remote checkout, the built archive, and the
+re-downloaded release archive pass the same 52-test suite. The private,
+isolated complex-project rehearsal from `v0.1.0` remains the migration evidence;
+it did not authorize a live project cutover.
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.1.0.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.1.1.zip
 ```
 
 The deterministic packager includes only its 28-file allowlist and produces a
@@ -271,7 +272,7 @@ SHA-256 sidecar. It refuses to overwrite an existing archive or checksum.
 
 ## Project status
 
-- Latest stable release: [`v0.1.0`](https://github.com/seriousz158/project-continuity/releases/tag/v0.1.0)
+- Latest stable release: [`v0.1.1`](https://github.com/seriousz158/project-continuity/releases/tag/v0.1.1)
 - Runtime dependencies: Python standard library only
 - Default mode: local, explicit, no background service
 - License: [MIT](LICENSE)

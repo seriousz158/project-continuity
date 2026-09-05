@@ -6,7 +6,7 @@ test for behavior changes.
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.1.0.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.1.1.zip
 ```
 
 Do not commit generated archives, `.relay/` state, caches, credentials, or

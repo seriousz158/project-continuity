@@ -200,11 +200,11 @@ python scripts/write_current.py --help
 
 ## 验证情况
 
-`v0.1.0` 来自完整 GitHub Actions 矩阵通过的提交。源码目录、远端干净克隆、构建后的压缩包以及从 Release 重新下载的压缩包，都运行了同一组 52 项测试。一个私有隔离复杂项目演练保留了完整 verifier 结果，迁移新增失败为 0；该结果没有授权真实项目切换。
+`v0.1.1` 收录本次 README 重构，不改变 CLI 或 `project-continuity/v2` 协议行为。它仅在完整 GitHub Actions 矩阵、远端干净克隆、构建后的压缩包以及从 Release 重新下载的压缩包均通过同一组 52 项测试后发布。`v0.1.0` 的私有隔离复杂项目演练仍作为迁移证据；该结果没有授权真实项目切换。
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.1.0.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.1.1.zip
 ```
 
 确定性打包器只包含 28 个 allowlist 文件，同时生成 SHA-256 sidecar；如果压缩包或校验文件已存在，它会拒绝覆盖。
@@ -220,7 +220,7 @@ python scripts/package_skill.py /tmp/project-continuity-v0.1.0.zip
 
 ## 项目状态
 
-- 最新稳定版本：[`v0.1.0`](https://github.com/seriousz158/project-continuity/releases/tag/v0.1.0)
+- 最新稳定版本：[`v0.1.1`](https://github.com/seriousz158/project-continuity/releases/tag/v0.1.1)
 - 运行依赖：仅 Python 标准库
 - 默认模式：本地、显式、没有后台服务
 - 许可证：[MIT](LICENSE)
