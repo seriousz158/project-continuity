@@ -6,11 +6,11 @@ test for behavior changes.
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.1.0-rc.1.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.1.0.zip
 ```
 
 Do not commit generated archives, `.relay/` state, caches, credentials, or
 private client data. Before proposing a release, inspect the final diff and
 report actual platform coverage rather than inferring it from the CI matrix.
-Uploading a release candidate must wait for user confirmation of the final
-archive manifest and destination; building an archive is not publication.
+Publishing a release must wait for user confirmation of the final archive
+manifest and destination; building an archive is not publication.

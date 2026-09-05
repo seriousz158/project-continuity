@@ -5,10 +5,11 @@ across coding agents. The v2 format stores authoritative JSON and a derived
 human-readable view in `.relay/CURRENT.md`, protected by revision checks, writer
 leases, operation receipts, local locks, atomic writes, and history snapshots.
 
-**Version:** `0.1.0-rc.1` release candidate. Release gates are still pending.
-The repository targets macOS, Linux, and Windows with Python 3.11, 3.12, and
-3.13; this statement describes the CI matrix, not completed verification on all
-nine combinations. No claim is made that live clients or existing projects have migrated.
+**Version:** `0.1.0` release preparation. The repository CI targets macOS,
+Linux, and Windows with Python 3.11, 3.12, and 3.13. The stable tag and release
+are created only after the release commit passes all nine jobs. No claim is made
+that existing projects have migrated or that an active client has hot-reloaded
+an on-disk installation.
 
 ## Why
 
@@ -89,7 +90,7 @@ installed directory.
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.1.0-rc.1.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.1.0.zip
 ```
 
 The packager uses an explicit repository allowlist, sorted archive records, fixed

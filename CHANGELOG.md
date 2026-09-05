@@ -1,8 +1,9 @@
 # Changelog
 
-## 0.1.0-rc.1 - Unreleased
+## 0.1.0 - 2026-09-05
 
-Release candidate pending project gates.
+First stable release. The tag remains gated on the release commit's complete CI
+matrix, clean-package verification, and publication review.
 
 - Add the v2 structured JSON state and derived Markdown view.
 - Add explicit init, read-only status/validation, leased writes, revision CAS,
@@ -11,5 +12,9 @@ Release candidate pending project gates.
 - Capture Git baselines from raw index/tree and worktree bytes with a bounded,
   fail-closed fingerprint instead of commands that may execute clean filters.
 
-No claim is made that all CI jobs, live clients, or existing-project migration have been
-completed.
+- Verify the generic migration design with a private, isolated complex-project
+  rehearsal: the v2 reader added no verifier regressions while the project's
+  existing failures remained unchanged. This does not authorize live cutover.
+
+Live-client hot loading and migration of existing projects remain separately
+scoped validations; they are not implied by this release.

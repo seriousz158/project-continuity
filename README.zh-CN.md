@@ -5,9 +5,9 @@
 视图，并用 revision 校验、writer lease、operation receipt、本地文件锁、原子写入
 和历史快照保护状态。
 
-**版本：** `0.1.0-rc.1` 发布候选版，发布 Gate 尚未完成。项目计划覆盖 macOS、
-Linux、Windows 及 Python 3.11、3.12、3.13；这只是 CI 矩阵目标，并不表示九种组合
-已经全部实测通过。当前也不声称真实客户端或现有项目已完成迁移。
+**版本：** `0.1.0` 发布准备版。仓库 CI 覆盖 macOS、Linux、Windows 及 Python
+3.11、3.12、3.13；只有发布提交的九个任务全部通过后才创建稳定 tag 和 Release。
+当前不声称既有项目已经迁移，也不把磁盘安装等同于活动客户端已热加载。
 
 ## 设计目的
 
@@ -79,7 +79,7 @@ Git 漂移，不是自动绕过。完整说明见[命令参考](references/comma
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.1.0-rc.1.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.1.0.zip
 ```
 
 打包器使用显式仓库文件 allowlist、排序记录和固定元数据，并生成 SHA-256 sidecar；
