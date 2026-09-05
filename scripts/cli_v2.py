@@ -130,7 +130,7 @@ def checked(document):
 
 
 def initialize(args, root):
-    project_id = args.project_id or str(uuid.uuid4())
+    project_id = args.project_id if args.project_id is not None else str(uuid.uuid4())
     p.identifier(project_id)
     state = p.empty_state(args.name or "Project")
     current = fs.child(root, ".relay", "CURRENT.md")

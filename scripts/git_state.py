@@ -80,6 +80,10 @@ def capture(root):
             total += before.st_size
             if total > MAX_FINGERPRINT_BYTES:
                 return error('raw fingerprint exceeds 64 MiB budget')
+            # Frame binary content and include executable permissions even when
+            # the repository was already dirty before a mode-only change.
+            executable_bits = before.st_mode & 0o111 if os.name != 'nt' else 0
+            fingerprint.update(f'file:{executable_bits}:{before.st_size}\0'.encode())
             flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
             fd = os.open(path, flags)
             with os.fdopen(fd, 'rb') as handle:

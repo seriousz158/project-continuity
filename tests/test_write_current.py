@@ -62,6 +62,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(current.read_bytes(), before)
         self.call('validate')
 
+    def test_empty_explicit_project_id_does_not_initialize(self):
+        self.call('init', '--project-id', '', ok=False)
+        self.assertFalse((self.root / '.relay').exists())
+
     def test_update_save_handoff_and_replay(self):
         self.init_resume()
         args = ('update', '--writer', 'agent:a', '--expected-revision', '1', '--operation-id', 'op2', '--input', '-')
