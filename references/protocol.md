@@ -2,10 +2,19 @@
 
 ## Storage
 
-`.relay/CURRENT.md` contains schema `project-continuity/v2`, metadata, one
-authoritative JSON block, and one derived Markdown view. The view is regenerated
-from JSON and is never parsed as state. The maximum document size is 64 KiB.
-History snapshots are append-only records of prior revisions.
+`.relay/CURRENT.md` contains schema `project-continuity/v2` (the default) or
+`project-continuity/v3` (receipt-aware), metadata, one authoritative JSON block,
+and one derived Markdown view. The view is regenerated from JSON and is never
+parsed as state. The maximum document size is 64 KiB. History snapshots are
+append-only records of prior revisions.
+
+When the candidate reaches 80% of the limit, the CLI automatically keeps the
+newest 32 operation receipts in `CURRENT.md` and writes older receipts as
+content-addressed JSONL segments under `.relay/receipts/`. Explicit `migrate --to-v3 --apply` is required before automatic governance; old v2 clients reject v3 instead of silently losing
+retry protection. Tasks, blockers, evidence, decisions, extensions, and custom
+Markdown are never automatically removed or moved. The target after a
+successful compaction is 70%; if business content alone does not fit, the
+write fails closed.
 
 After explicit initialization, `CURRENT.md` is the sole authority for a new
 project's current progress. For an existing project, built-in migration handles
@@ -44,6 +53,30 @@ acceptance criteria, choose arbitrary document paths, rewrite evidence, or
 rewrite decisions. Reopening a final task requires a reason and increments its
 generation, invalidating earlier evidence for completion.
 
+## Receipt archives and recovery
+
+The `extensions.compaction` object stores only the archive schema, chain head,
+cumulative archived count, and retention count. `status` reports both the
+inline/current and archived receipt counts. Each segment contains a project
+ID, previous-segment link, operation ID/hash/revision records, and is named by
+the SHA-256 of its exact bytes. Only segments reachable from the current chain
+head are committed history; orphan files after a failed pre-commit are not
+imported or deleted automatically. `status` reports a degraded read-only state
+for a missing or damaged chain; `validate` and all mutations fail closed until
+the archive is repaired or an explicit history recovery is performed.
+
+`compact` is read-only by default. `compact --apply` requires the same writer,
+revision, lease, and operation-ID checks as other mutations. `migrate --to-v3`
+explicitly upgrades a v2 document without changing project data. A single
+`--no-auto-compact` write can retain the old v2 behavior, but it cannot bypass
+the hard 64 KiB limit.
+
+`export --output HANDOFF.zip` is an explicit, no-overwrite operation that
+packages `CURRENT.md`, a manifest, and only chain-reachable receipt segments.
+It never includes `history/`, `inbox/`, locks, or backups. `verify --bundle`
+validates entry paths, checksums, schema, and the receipt chain in a temporary
+directory without modifying the target project.
+
 ## Concurrency and recovery
 
 Revision comparison-and-swap rejects stale writers. A non-expired lease rejects
@@ -76,3 +109,23 @@ CRLF conversion and repositories that rely on clean filters can be reported
 conservatively as dirty because raw worktree bytes differ from indexed blobs.
 An unavailable or over-budget baseline is an explicit error/unknown result, not
 evidence that the tree is clean.
+
+
+### Capacity retention semantics
+
+The 32-receipt retention is a post-compaction target, not a validation limit.
+Below 52,429 bytes, v3 may accumulate more receipts without archiving.
+Governance may compact managed JSON and use a compact derived view; custom
+Markdown remains unchanged. Compact previews without operation parameters are
+estimates and exclude the new operation metadata, not commit guarantees.
+Fully parameterized previews use the commit planner without writing files;
+apply repeats validation under lock.
+
+
+### Long-running projects
+
+Archive validation is linear in committed receipt history. Segments are batched
+at the byte threshold, not created on every update. There is no persistent
+index, automatic archive deletion, or distributed locking. Export/verify use
+matching uncompressed budgets; a project can outgrow the bundle budget even
+while CURRENT remains small. Transfer must then be planned explicitly.

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0-rc.1 - 2026-09-08
+
+Automatic, lossless receipt-capacity governance.
+
+- Keep the newest 32 operation receipts inline and archive older receipts in a
+  content-addressed `.relay/receipts/` chain when a write reaches 80% of 64 KiB.
+- Add `compact` preview/apply, explicit `migrate --to-v3`, archive integrity
+  reporting, archived-operation retry lookup, controlled `export`/`verify`
+  handoff bundles, and `--no-auto-compact` escape hatch for a single write.
+- Preserve fail-closed CAS, lease, Git-drift, atomic/history ordering, secret
+  scanning, and the rule that project records are never truncated.
+- Add capacity, archive, v3 migration, and package regression coverage.
+
+- Require explicit v2-to-v3 migration; normal v2 writes never change protocol.
+- Use one candidate planner, full-parameter read-only previews, and lossless
+  compact managed rendering without changing custom Markdown.
+- Verify handoff schema and exact reachable archives using one ZIP read.
+
+Release candidate: not a declaration of stable release, live project migration,
+or client runtime reload. See CI and release notes for verification evidence.
+
 ## 0.1.1 - 2026-09-06
 
 Documentation-focused patch release. CLI and `project-continuity/v2` protocol

@@ -220,6 +220,72 @@ def atomic(path: Path, document: str) -> list[str]:
                     warnings.append("durability: replacement committed but directory close failed")
 
 
+def immutable(path: Path, document: str) -> list[str]:
+    """Create *path* exactly once, or verify an identical existing file.
+
+    Receipt segments are content addressed.  Unlike ``atomic`` this helper
+    never replaces an existing target, which makes retries and races safe.
+    """
+    temporary = None
+    parent_fd = None
+    try:
+        path = _absolute(path)
+        payload = document.encode("utf-8")
+        parent_before = _check(path.parent)
+        _validate(parent_before, directory=True)
+        existing = _check(path, missing=True)
+        if existing is not None:
+            _regular(existing)
+            if read(path, max_bytes=max(len(payload), 1)) != document:
+                raise Error("immutable file conflicts with existing content")
+            return []
+        if os.name != "nt":
+            parent_fd = os.open(path.parent, _flags(os.O_RDONLY) | getattr(os, "O_DIRECTORY", 0))
+            if _identity(os.fstat(parent_fd)) != _identity(parent_before):
+                raise Error("parent directory changed while opening")
+        fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        temporary = Path(raw)
+        with os.fdopen(fd, "wb") as handle:
+            _check_open(temporary, handle.fileno(), None)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if _identity(_check(path.parent)) != _identity(parent_before):
+            raise Error("parent directory changed before publishing")
+        try:
+            # Hard-link publication is exclusive on POSIX and Windows NTFS;
+            # a competing creator therefore cannot be overwritten.
+            os.link(temporary, path)
+        except FileExistsError:
+            if read(path, max_bytes=max(len(payload), 1)) != document:
+                raise Error("immutable file conflicts with existing content")
+            return []
+        temporary.unlink()
+        temporary = None
+        warnings = []
+        try:
+            if parent_fd is None:
+                warnings.append("durability: parent directory fsync is unavailable on this platform")
+            else:
+                os.fsync(parent_fd)
+        except OSError:
+            warnings.append("durability: immutable file committed but parent fsync failed")
+        return warnings
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise Error("immutable write failed before commit") from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
 @contextmanager
 def locked(path: Path):
     fd = None

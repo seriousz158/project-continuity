@@ -7,8 +7,19 @@ import json
 import re
 from datetime import datetime
 
+# v2 remains the default wire format so existing installations keep working.
+# v3 is selected explicitly (or on the first automatic receipt compaction) and
+# is rejected by old clients rather than silently dropping archived receipts.
 SCHEMA = "project-continuity/v2"
+SCHEMA_V2 = SCHEMA
+SCHEMA_V3 = "project-continuity/v3"
+SUPPORTED_SCHEMAS = (SCHEMA_V2, SCHEMA_V3)
+RECEIPT_SCHEMA = "project-continuity/receipts/v1"
 MAX_BYTES = 65536
+COMPACTION_TRIGGER_BYTES = (MAX_BYTES * 80 + 99) // 100
+COMPACTION_TARGET_BYTES = int(MAX_BYTES * 0.7)
+RECEIPT_KEEP = 32
+RECEIPT_SEGMENT_MAX = 128
 DATA_START = "<!-- project-continuity:data -->\n```json\n"
 DATA_END = "\n```\n<!-- project-continuity:/data -->"
 VIEW_START = "<!-- project-continuity:view -->\n"
@@ -95,6 +106,18 @@ def validate(state):
     for value in project["outcomes"].values():
         text(value, "outcome")
     require(isinstance(state["extensions"], dict), "extensions must be an object")
+    compaction = state["extensions"].get("compaction")
+    if compaction is not None:
+        require(isinstance(compaction, dict) and set(compaction) == {"schema", "head", "count", "retained"},
+                "invalid compaction metadata")
+        require(compaction["schema"] == RECEIPT_SCHEMA, "invalid compaction schema")
+        head = compaction["head"]
+        require(head is None or (isinstance(head, str) and re.fullmatch(r"[0-9a-f]{64}\.jsonl", head)),
+                "invalid compaction head")
+        require(type(compaction["count"]) is int and compaction["count"] >= 0, "invalid compaction count")
+        require(compaction["head"] is not None or compaction["count"] == 0, "compaction head missing")
+        require(type(compaction["retained"]) is int and compaction["retained"] == RECEIPT_KEEP,
+                "invalid compaction retention")
     tasks, blockers, evidence, decisions = (keyed(state[k], k) for k in COLLECTIONS)
     require(project["current_task"] is None or project["current_task"] in tasks, "current task missing")
     for task in tasks.values():
@@ -172,6 +195,7 @@ def apply(state, patch, baseline):
         out["project"].update(patch["project"])
     if "extensions" in patch:
         require(isinstance(patch["extensions"], dict), "extensions change must be object")
+        require("compaction" not in patch["extensions"], "compaction metadata is managed internally")
         out["extensions"].update(patch["extensions"])
     for name in COLLECTIONS:
         rows = keyed(out[name], name)
@@ -235,15 +259,23 @@ def parse_body(body):
     c, d = block(body, VIEW_START, VIEW_END)
     require(b + len(DATA_END) <= c - len(VIEW_START) or d + len(VIEW_END) <= a - len(DATA_START), "overlapping managed sections")
     state = validate(loads(body[a:b]))
-    return state, body[c:d].replace('\r\n', '\n') == view(state)
+    return state, body[c:d].replace('\r\n', '\n') in (view(state), compact_view(state))
 
 
-def render_body(state, body=None):
+def compact_view(state):
+    return "# Project progress\n\nStatus: " + state["project"]["status"] + "\nSee the structured block for tasks, evidence, blockers and next step.\n"
+
+
+def render_body(state, body=None, compact=False):
     validate(state)
     if body is None:
         body = DATA_START + "{}" + DATA_END + "\n\n" + VIEW_START + "" + VIEW_END + "\n"
-    replacements = [(DATA_START, DATA_END, json.dumps(state, ensure_ascii=False, indent=2, allow_nan=False)),
-                    (VIEW_START, VIEW_END, view(state))]
+    if body is not None:
+        a, b = block(body, VIEW_START, VIEW_END)
+        compact = compact or body[a:b].startswith("# Project progress\n\nStatus: ")
+    replacements = [(DATA_START, DATA_END, json.dumps(state, ensure_ascii=False,
+                    indent=None if compact else 2, separators=(",", ":") if compact else None, allow_nan=False)),
+                    (VIEW_START, VIEW_END, compact_view(state) if compact else view(state))]
     for start, end, value in replacements:
         a, b = block(body, start, end)
         body = body[:a] + value + body[b:]

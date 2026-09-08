@@ -29,7 +29,9 @@ decisions, and exact next step in one reviewable file:
 
 The file contains authoritative structured JSON and a generated Markdown view.
 Agents read the same state, writes use revision checks and a writer lease, and a
-formal handoff releases that lease for the next agent. No chat replay, daemon,
+formal handoff releases that lease for the next agent. When the file approaches
+the 64 KiB limit, old operation receipts are archived synchronously and
+losslessly; project records are never truncated. No chat replay, daemon,
 database, cloud service, or model call is required.
 
 ## Why it exists
@@ -54,6 +56,7 @@ keeping the project state small enough for humans to review.
 ├── CURRENT.md    # sole authority for current project progress after cutover
 ├── .gitignore    # keeps local runtime data local by default
 ├── history/      # immutable prior revisions
+├── receipts/     # content-addressed receipt segments (v3, local by default)
 └── inbox/        # optional, unmerged agent input
 ```
 
@@ -91,7 +94,8 @@ flowchart LR
 3. **Update** — typed ID-based changes advance the revision while retaining the
    lease.
 4. **Save** — the prior revision is archived, the new state is committed
-   atomically, and the lease is released.
+   atomically, and the lease is released. Capacity governance runs inside the
+   same locked transaction before the replacement.
 5. **Recover** — only an expired lease or supported history repair can enter the
    explicit recovery path.
 
@@ -127,8 +131,32 @@ next write. An operation ID may be retried only with identical input. The
 default lease lasts 30 minutes; `--allow-drift` is valid only after the reported
 Git drift has been reviewed.
 
+Capacity is handled automatically: at 80% of 64 KiB the newest 32 receipts are
+kept inline and older receipts are moved losslessly to `.relay/receipts/`, which
+requires prior explicit migration to v3. Preview or explicitly request the same operation with:
+
+```bash
+python scripts/write_current.py compact --root /path/to/project
+python scripts/write_current.py compact --apply --root /path/to/project \
+  --writer agent-a --expected-revision 3 --operation-id compact-001
+```
+
+`compact` without `--apply` is read-only. A one-off `--no-auto-compact` option
+is available on `resume`, `update`, and `save`; it never bypasses the hard
+limit.
+
+For an explicit cross-client transfer, export and verify a controlled bundle;
+history, inbox, locks, and backups remain local:
+
+```bash
+python scripts/write_current.py export --root /path/to/project \
+  --output /tmp/project-continuity-handoff.zip
+python scripts/write_current.py verify --bundle /tmp/project-continuity-handoff.zip
+```
+
 See the [command reference](references/commands.md) for migration, recovery,
-custom lease duration, standard-input changes, and reviewed Git drift.
+custom lease duration, standard-input changes, capacity preview/compaction, and
+reviewed Git drift.
 
 ## Common workflows
 
@@ -140,6 +168,7 @@ custom lease duration, standard-input changes, and reviewed Git drift.
 | Hand work to another agent | Record verified state with `save`; the lease is released |
 | Continue in a fresh session | `status` → read next step and blockers → `resume` |
 | Convert a v1 relay document | `migrate` dry run → review exact source hash → explicit apply |
+| Enable receipt-aware v3 | `migrate --to-v3` dry run → review source hash → explicit apply (required before automatic compaction) |
 | Repair after interruption | `status` + `validate` → `recover` only after lease expiry |
 
 ## Core guarantees
@@ -153,6 +182,7 @@ custom lease duration, standard-input changes, and reviewed Git drift.
 | Safe retries | Operation ID and input hash produce an idempotent receipt |
 | Evidence-backed completion | Acceptance coverage and task generation are validated |
 | Crash-safe commit | Prior-version snapshot, temporary file, sync, and atomic replacement |
+| Bounded protocol growth | At 80% capacity, newest 32 receipts stay inline and older receipts move to a content-addressed chain |
 | Git-aware resume | Branch, HEAD, index, tracked bytes, dirty and untracked state are distinguished |
 | Conservative input handling | Path/link checks, 64 KiB document limit, and common-secret detection |
 
@@ -246,19 +276,19 @@ from the installed directory.
 
 ## Verification
 
-Version `v0.1.1` packages this README redesign without changing CLI or
-`project-continuity/v2` protocol behavior. It is released only after the full
-GitHub Actions matrix, a clean remote checkout, the built archive, and the
-re-downloaded release archive pass the same 52-test suite. The private,
-isolated complex-project rehearsal from `v0.1.0` remains the migration evidence;
-it did not authorize a live project cutover.
+The working tree contains the receipt-aware `v0.2.0-rc.1` implementation. This is a
+candidate, not a release claim: the full GitHub Actions matrix, a clean remote
+checkout, the built archive, and the re-downloaded release archive must pass
+the expanded suite before publication. The private, isolated complex-project
+rehearsal from `v0.1.0` remains migration evidence; it did not authorize a live
+project cutover.
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.1.1.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.2.0-rc.1.zip
 ```
 
-The deterministic packager includes only its 28-file allowlist and produces a
+The deterministic packager includes only its allowlisted source files and produces a
 SHA-256 sidecar. It refuses to overwrite an existing archive or checksum.
 
 ## Documentation

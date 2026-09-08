@@ -26,7 +26,7 @@
 .relay/CURRENT.md
 ```
 
-文件内部由权威的结构化 JSON 和自动生成的 Markdown 视图组成。所有 Agent 读取同一状态；写入经过 revision 校验和 writer lease；正式交接会释放 lease，让下一位 Agent 安全接棒。整个流程不依赖聊天回放、后台服务、数据库、云服务或模型调用。
+文件内部由权威的结构化 JSON 和自动生成的 Markdown 视图组成。所有 Agent 读取同一状态；写入经过 revision 校验和 writer lease；正式交接会释放 lease，让下一位 Agent 安全接棒。接力文件接近 64 KiB 上限时，CLI 会在同一锁内无损归档旧操作回执，不会截断项目记录。整个流程不依赖聊天回放、后台服务、数据库、云服务或模型调用。
 
 ## 为什么需要它
 
@@ -47,6 +47,7 @@ Project Continuity 把这些风险变成明确的协议校验，同时保持状�
 ├── CURRENT.md    # 完成切换后，当前项目进度的唯一权威
 ├── .gitignore    # 默认让运行态保留在本地
 ├── history/      # 不可覆盖的历史 revision
+├── receipts/     # v3 内容寻址的回执片段，默认只在本地
 └── inbox/        # 可选、尚未合并的 Agent 输入
 ```
 
@@ -78,7 +79,7 @@ flowchart LR
 1. **检查**：`status` 与 `validate` 完全只读，不会隐式初始化项目。
 2. **接棒**：Agent 核对 Git 漂移，并使用实际 revision 取得 writer lease。
 3. **更新**：按稳定 ID 提交结构化变更，revision 增加但 lease 保留。
-4. **保存**：先归档旧 revision，再原子提交新状态并释放 lease。
+4. **保存**：先归档旧 revision，再原子提交新状态并释放 lease。容量治理在同一锁内完成后才替换当前文件。
 5. **恢复**：只有 lease 已过期或存在受支持的历史修复场景，才允许显式 `recover`。
 
 ## 快速开始
@@ -110,7 +111,25 @@ python scripts/write_current.py save --root /path/to/project \
 
 每次成功写入都会增加 revision。下一次写入前重新读取 `status`。同一个 operation ID 只能在输入完全相同时安全重试。默认 lease 为 30 分钟；只有审查过报告的 Git 漂移后才能使用 `--allow-drift`。
 
-迁移、恢复、自定义 lease、标准输入和 Git 漂移确认参数见[命令参考](references/commands.md)。
+容量会自动治理：达到 64 KiB 的 80% 时，最新 32 条回执保留在当前文件，其余回执无损写入 `.relay/receipts/`，前提是已显式迁移为 v3。可以先预览或显式执行：
+
+```bash
+python scripts/write_current.py compact --root /path/to/project
+python scripts/write_current.py compact --apply --root /path/to/project \
+  --writer agent-a --expected-revision 3 --operation-id compact-001
+```
+
+不带 `--apply` 的 `compact` 完全只读。`resume`、`update` 和 `save` 支持单次 `--no-auto-compact`，但不会绕过硬上限。
+
+如需明确地跨客户端传递，可导出并校验受控交接包；history、inbox、锁和备份仍保留在本地：
+
+```bash
+python scripts/write_current.py export --root /path/to/project \
+  --output /tmp/project-continuity-handoff.zip
+python scripts/write_current.py verify --bundle /tmp/project-continuity-handoff.zip
+```
+
+迁移、恢复、自定义 lease、标准输入、容量预览和回执压缩见[命令参考](references/commands.md)。
 
 ## 常用工作流
 
@@ -122,6 +141,7 @@ python scripts/write_current.py save --root /path/to/project \
 | 交给另一个 Agent | 用 `save` 记录已验证状态并释放 lease |
 | 新会话继续 | `status` → 读取下一步和阻塞 → `resume` |
 | 转换 v1 relay | `migrate` dry-run → 审查源哈希 → 显式 apply |
+| 启用回执 v3 | `migrate --to-v3` dry-run → 审查源哈希 → 显式 apply（自动治理前必须显式迁移） |
 | 中断后修复 | `status` + `validate` → lease 过期后才 `recover` |
 
 ## 核心保证
@@ -135,6 +155,7 @@ python scripts/write_current.py save --root /path/to/project \
 | 重试安全 | operation ID 与输入哈希形成幂等回执 |
 | 完成必须有证据 | 校验验收覆盖和任务 generation |
 | 崩溃安全提交 | 旧版本快照、临时文件、同步和原子替换 |
+| 协议增长有界 | 达到 80% 容量时保留最新 32 条回执，其余完整写入内容寻址归档链 |
 | 接棒时识别 Git 漂移 | 分开识别 branch、HEAD、index、tracked bytes、dirty 与 untracked |
 | 保守处理输入 | 路径/链接检查、64 KiB 上限和常见秘密扫描 |
 
@@ -200,14 +221,14 @@ python scripts/write_current.py --help
 
 ## 验证情况
 
-`v0.1.1` 收录本次 README 重构，不改变 CLI 或 `project-continuity/v2` 协议行为。它仅在完整 GitHub Actions 矩阵、远端干净克隆、构建后的压缩包以及从 Release 重新下载的压缩包均通过同一组 52 项测试后发布。`v0.1.0` 的私有隔离复杂项目演练仍作为迁移证据；该结果没有授权真实项目切换。
+工作区已实现带回执容量治理的 `v0.2.0-rc.1` 候选功能，但尚未宣称正式发布。正式发布前必须通过完整 GitHub Actions 矩阵、远端干净克隆、发行压缩包和重新下载的压缩包验证。`v0.1.0` 的私有隔离复杂项目演练仍只是迁移证据；该结果没有授权真实项目切换。
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.1.1.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.2.0-rc.1.zip
 ```
 
-确定性打包器只包含 28 个 allowlist 文件，同时生成 SHA-256 sidecar；如果压缩包或校验文件已存在，它会拒绝覆盖。
+确定性打包器只包含 allowlist 文件，同时生成 SHA-256 sidecar；如果压缩包或校验文件已存在，它会拒绝覆盖。
 
 ## 文档
 
@@ -221,6 +242,7 @@ python scripts/package_skill.py /tmp/project-continuity-v0.1.1.zip
 ## 项目状态
 
 - 最新稳定版本：[`v0.1.1`](https://github.com/seriousz158/project-continuity/releases/tag/v0.1.1)
+- 下一候选版本：`v0.2.0-rc.1`（自动回执容量治理，尚未发布）
 - 运行依赖：仅 Python 标准库
 - 默认模式：本地、显式、没有后台服务
 - 许可证：[MIT](LICENSE)

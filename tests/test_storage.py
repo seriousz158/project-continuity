@@ -234,6 +234,14 @@ class StorageTests(unittest.TestCase):
             storage.commit(current, self.root / "history", "stale", "new", 1)
         self.assertEqual(storage.read(current), "actual")
 
+    def test_immutable_receipt_never_overwrites(self):
+        path = self.root / "receipt.jsonl"
+        self.assertEqual(bool(storage.immutable(path, "first")), os.name == "nt")
+        self.assertEqual(storage.immutable(path, "first"), [])
+        with self.assertRaises(storage.Error):
+            storage.immutable(path, "different")
+        self.assertEqual(path.read_text(encoding="utf-8"), "first")
+
     def test_regular_lock_and_hardlinked_lock(self):
         path = self.root / "lock"
         with storage.locked(path):

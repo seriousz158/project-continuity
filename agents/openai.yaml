@@ -1,4 +1,4 @@
 interface:
   display_name: "Project Continuity"
-  short_description: "Structured, conflict-safe handoffs across coding agents"
-  default_prompt: "Use $project-continuity to inspect, resume, update, or save this project's handoff safely."
+  short_description: "Safe project handoffs with receipt capacity governance"
+  default_prompt: "Use $project-continuity to inspect, resume, update, save, compact, or verify this project's handoff safely."
