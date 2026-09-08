@@ -221,11 +221,15 @@ python scripts/write_current.py --help
 
 ## 验证情况
 
-工作区已实现带回执容量治理的 `v0.2.0-rc.1` 候选功能，但尚未宣称正式发布。正式发布前必须通过完整 GitHub Actions 矩阵、远端干净克隆、发行压缩包和重新下载的压缩包验证。`v0.1.0` 的私有隔离复杂项目演练仍只是迁移证据；该结果没有授权真实项目切换。
+`v0.2.0` 包含 66 项测试，覆盖批量归档增长、历史重试、存储故障注入和干净发行包运行。
+[CI 矩阵](https://github.com/seriousz158/project-continuity/actions/workflows/ci.yml)
+覆盖 macOS、Linux、Windows × Python 3.11–3.13；具体提交的结果见 Release Notes。
+私有历史快照容量演练保留了项目记录与自定义正文，没有应用待处理业务补丁，也不代表真实项目切换。
+客户端发现、脚本运行和实际模型会话加载分别验收，不相互替代。
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.2.0-rc.1.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.2.0.zip
 ```
 
 确定性打包器只包含 allowlist 文件，同时生成 SHA-256 sidecar；如果压缩包或校验文件已存在，它会拒绝覆盖。
@@ -241,8 +245,7 @@ python scripts/package_skill.py /tmp/project-continuity-v0.2.0-rc.1.zip
 
 ## 项目状态
 
-- 最新稳定版本：[`v0.1.1`](https://github.com/seriousz158/project-continuity/releases/tag/v0.1.1)
-- 下一候选版本：`v0.2.0-rc.1`（自动回执容量治理，尚未发布）
+- 最新稳定版本：[`v0.2.0`](https://github.com/seriousz158/project-continuity/releases/tag/v0.2.0)
 - 运行依赖：仅 Python 标准库
 - 默认模式：本地、显式、没有后台服务
 - 许可证：[MIT](LICENSE)

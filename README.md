@@ -276,16 +276,18 @@ from the installed directory.
 
 ## Verification
 
-The working tree contains the receipt-aware `v0.2.0-rc.1` implementation. This is a
-candidate, not a release claim: the full GitHub Actions matrix, a clean remote
-checkout, the built archive, and the re-downloaded release archive must pass
-the expanded suite before publication. The private, isolated complex-project
-rehearsal from `v0.1.0` remains migration evidence; it did not authorize a live
-project cutover.
+The receipt-aware `v0.2.0` suite covers 66 tests, including batch archive growth,
+archived retries, injected storage failures, and clean package execution.
+The [CI matrix](https://github.com/seriousz158/project-continuity/actions/workflows/ci.yml)
+covers macOS, Linux and Windows on Python 3.11–3.13. See the release notes for
+commit-specific results. A private historical-snapshot capacity rehearsal
+preserved project records and custom Markdown; it did not apply pending
+business changes or authorize live project cutover. Client discovery, script
+execution and actual model-session reload are separate verification levels.
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.2.0-rc.1.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.2.0.zip
 ```
 
 The deterministic packager includes only its allowlisted source files and produces a
@@ -302,7 +304,7 @@ SHA-256 sidecar. It refuses to overwrite an existing archive or checksum.
 
 ## Project status
 
-- Latest stable release: [`v0.1.1`](https://github.com/seriousz158/project-continuity/releases/tag/v0.1.1)
+- Latest stable release: [`v0.2.0`](https://github.com/seriousz158/project-continuity/releases/tag/v0.2.0)
 - Runtime dependencies: Python standard library only
 - Default mode: local, explicit, no background service
 - License: [MIT](LICENSE)

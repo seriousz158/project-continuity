@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0-rc.1 - 2026-09-08
+## 0.2.0 - 2026-09-08
 
 Automatic, lossless receipt-capacity governance.
 
@@ -18,8 +18,9 @@ Automatic, lossless receipt-capacity governance.
   compact managed rendering without changing custom Markdown.
 - Verify handoff schema and exact reachable archives using one ZIP read.
 
-Release candidate: not a declaration of stable release, live project migration,
-or client runtime reload. See CI and release notes for verification evidence.
+Explicit protocol migration is required for existing projects. Publication
+and disk installation do not imply live project migration or client hot reload.
+See CI and release notes for platform and package verification evidence.
 
 ## 0.1.1 - 2026-09-06
 

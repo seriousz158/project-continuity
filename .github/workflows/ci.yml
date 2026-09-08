@@ -25,10 +25,10 @@ jobs:
       - name: Build and verify source package
         shell: bash
         run: |
-          python scripts/package_skill.py "$RUNNER_TEMP/project-continuity-v0.2.0-rc.1.zip"
+          python scripts/package_skill.py "$RUNNER_TEMP/project-continuity-v0.2.0.zip"
           python - <<'PY'
           import hashlib, os, pathlib
-          archive = pathlib.Path(os.environ["RUNNER_TEMP"]) / "project-continuity-v0.2.0-rc.1.zip"
+          archive = pathlib.Path(os.environ["RUNNER_TEMP"]) / "project-continuity-v0.2.0.zip"
           expected = archive.with_name(archive.name + ".sha256").read_text(encoding="ascii").split()[0]
           assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected
           PY
