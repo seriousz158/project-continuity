@@ -282,6 +282,10 @@ with s.locked(pathlib.Path(sys.argv[2])):
         self.assertTrue(acquired.exists())
 
 
+@unittest.skipUnless(os.name != "nt",
+                     "publication-window acknowledgement is POSIX-only in 0.3.3; "
+                     "on Windows the storage layer fails closed by design and no "
+                     "second link is ever accepted (issue #1)")
 class PublicationWindowTests(unittest.TestCase):
     """A live publish window is waited out; a foreign or stuck link is refused.
 
