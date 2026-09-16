@@ -10,7 +10,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.3"
 ARCHIVE_ROOT = "project-continuity"
 FILES = (
     ".gitignore",
@@ -30,17 +30,25 @@ FILES = (
     "references/protocol.md",
     "scripts/cli_v2.py",
     "scripts/git_state.py",
+    "scripts/migrate_compare.py",
+    "scripts/objectstore.py",
     "scripts/package_skill.py",
     "scripts/progress.py",
+    "scripts/relay_errors.py",
     "scripts/storage.py",
+    "scripts/v4.py",
     "scripts/write_current.py",
+    "tests/test_assembly.py",
     "tests/test_package.py",
     "tests/test_capacity.py",
+    "tests/test_effective_evidence.py",
     "tests/test_git_state.py",
+    "tests/test_migrate_compare.py",
     "tests/test_progress.py",
     "tests/test_reliability.py",
     "tests/test_security_regressions.py",
     "tests/test_storage.py",
+    "tests/test_v4_objects.py",
     "tests/test_write_current.py",
 )
 

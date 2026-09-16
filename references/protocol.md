@@ -1,4 +1,144 @@
 # Protocol and data model
+## v4 external evidence objects
+
+Schema "project-continuity/v4" is an explicit upgrade: an existing v2 or v3
+document becomes v4 only through "migrate --to-v4".  The shared tooling still
+reads v2, v3 and v4; nothing is upgraded implicitly.
+
+CURRENT.md keeps the same front matter, managed JSON block and derived view,
+but the evidence collection is no longer inline:
+
+    CURRENT.md -> evidence_index_ref -> immutable evidence index -> objects
+
+The JSON "evidence" value is an index reference
+({schema, index, count, sha256}) whose count and digest are derived from the
+bound records; it is never an independently editable list.  A "corrections"
+collection of the same shape carries immutable corrections.
+
+Objects live under .relay/objects/ and every file name is the SHA-256 of that
+file's exact bytes:
+
+    objects/evidence/<aa>/<object_sha>.json
+    objects/correction/<aa>/<object_sha>.json
+    objects/manifest/<aa>/<manifest_sha>.json
+    objects/chunk/<aa>/<chunk_sha>.bin
+    objects/index/evidence/<aa>/<index_sha>.json
+    objects/index/correction/<aa>/<index_sha>.json
+
+An object envelope binds schema, project id, record type and content format
+version, and preserves the record verbatim under "payload".  Objects larger
+than 262144 bytes are split into ordered raw chunks with a content-addressed
+parent manifest that records the total length and the overall digest; every
+chunk is verified before the payload is parsed.  Index nodes are leaves
+(bounded entries) or branches (bounded children) with a maximum depth, and a
+node visited twice is RELAY_REFERENCE_CYCLE.
+
+Resolution is explicit:
+
+    resolve(document_text, project_root) -> complete logical state
+
+The project root is always supplied by the caller.  A v4 document without one
+is RELAY_SCHEMA_V4_REQUIRES_RESOLVER; a read-only envelope parse (front matter
+plus the managed JSON) exists for diagnostics but never decides completion.
+
+Integrity and budget semantics are deliberately distinct:
+
+  * a missing, mismatched, cross-project, unreadable, cyclic or over-limit
+    object/index/chunk is KNOWN CORRUPTION, named
+    (RELAY_OBJECT_MISSING, RELAY_OBJECT_HASH_MISMATCH,
+    RELAY_OBJECT_SCHEMA_INVALID, RELAY_OBJECT_PROJECT_MISMATCH,
+    RELAY_INDEX_INVALID, RELAY_CHUNK_MISSING, RELAY_REFERENCE_CYCLE,
+    RELAY_OBJECT_LIMIT_EXCEEDED, RELAY_OBJECT_PATH_INVALID,
+    RELAY_OBJECT_TYPE_INVALID) and reported as a read-only degraded state;
+    mutations and completion claims fail closed;
+  * a correction target that this build cannot bind to a real object is refused
+    by name before anything is published: RELAY_CORRECTION_TARGET_UNSUPPORTED
+    (no owned namespace) or RELAY_CORRECTION_TARGET_UNREACHABLE (the object is
+    outside the traceable range).  A syntactically valid digest is never
+    accepted as a verified target;
+  * exhausting the deep-validation time or IO budget is
+    RELAY_VALIDATION_BUDGET_EXCEEDED: the check is INCOMPLETE, never
+    corruption and never a PASS.  Any state commit or completion judgement
+    that depends on it is refused.
+
+CURRENT.md commits at or below 32768 bytes (V4_MAX_BYTES) after every
+successful v4 write, including the operation receipt, writer/lease and
+migration metadata.  The 64 KiB protocol ceiling is unchanged; v4 simply never
+spends the upper half.  Receipt governance uses the same archive chain, with
+the compaction trigger scaled to the v4 limit.
+
+Before publishing anything, a write estimates the unique new objects, the
+history snapshot and the candidate document under the single-writer lock.
+RELAY_STORAGE_QUOTA_EXCEEDED and RELAY_DISK_SPACE_INSUFFICIENT are raised
+before the CURRENT replacement, so a refused write leaves the committed
+document untouched and never reports a partial success.  Read-only diagnostics
+never require writing to a full disk.
+
+Optional v4 extensions:
+
+  * extensions.ac_map — deterministic, persistent acceptance-condition ids
+    (ac-<128-bit prefix of sha256(task_id + NUL + condition text)>), the
+    original text unchanged; "coverage" prints the
+    evidence x acceptance x generation matrix.
+  * extensions.blocker_scope — a versioned scope for a blocker.  A blocker
+    without an entry keeps its original scope (its own task); an entry may only
+    widen it and must still cover the declared task.  No new task status word
+    is introduced and no historical blocker is narrowed automatically.
+  * "corrections" — immutable correction/revocation/supersession records bound
+    to the exact digest of their target.  Revoked or superseded evidence never
+    satisfies a completion gate; coverage and handoff apply the same judgement,
+    and the target records stay queryable.  See "Effective evidence" below.
+
+## Effective evidence and correction targets
+
+Four judgements are kept separate and never substitute for each other:
+
+  1. recorded result — the pass/fail/not_run written in the record; never
+     rewritten in place;
+  2. current validity — whether a correction/revocation/supersession still lets
+     the record count, with the target relationship proven;
+  3. acceptance coverage — whether the task's acceptance conditions are covered
+     by a currently effective, generation-matching pass;
+  4. runtime/external verification — whether the recorded baseline matches the
+     environment and whether an external check ran to completion.
+
+A recorded pass is never reported as currently effective, and current coverage is
+never reported as verified.  When a baseline or an external check was not
+examined the result is named (baseline_not_checked, baseline_mismatch,
+baseline_unavailable, current_baseline_not_git) rather than implied by a null or
+an empty list.
+
+Relationship identity is the pair (record_type, record_id).  A revocation of a
+decision never affects an evidence record that happens to share the same string.
+Supported kinds and targets:
+
+  * "correction" annotates; it changes no validity and may annotate another
+    correction.  A relationship may not revoke or supersede a relationship.
+  * "revocation" removes its target from the effective set.
+  * "supersession" targets evidence only, names an existing evidence replacement,
+    and is rejected when the replacement chain cycles.
+
+Corrections are immutable: the same id with different content is refused, and a
+correction can never target itself.
+
+Manifest target types are not interchangeable:
+
+  * target_type "chunk_manifest" is the only manifest namespace this build owns.
+    It is resolved under an explicit project root at
+    objects/manifest/<aa>/<sha>.json from the committed evidence/corrections
+    index; the file must exist, its bytes must hash to the claimed digest, its
+    schema and type must match, its project id must match, and it must be inside
+    the traceable range.  The stored target_sha256 is derived from the resolved
+    manifest descriptor, never copied from the input.
+  * "manifest" and other ambiguous or unowned names (handoff bundle manifests,
+    external evidence manifests) are refused by name.  Because every field of a
+    valid evidence or correction record is bounded, no record envelope accepted
+    by the validator can reach the 262144-byte chunk threshold, so no valid
+    document can currently reference a chunk manifest at all; the resolver path
+    exists, is verified against real published bytes, and fails closed.
+
+A root-bound target is re-verified inside the write lock immediately before the
+CURRENT replacement, so verification and commit cannot drift apart.
 
 ## Storage
 
@@ -120,6 +260,19 @@ Markdown remains unchanged. Compact previews without operation parameters are
 estimates and exclude the new operation metadata, not commit guarantees.
 Fully parameterized previews use the commit planner without writing files;
 apply repeats validation under lock.
+
+`capacity` never presents an estimate that omits the next operation metadata as
+proof that the next commit fits.  Its estimate models a resume, including the
+new receipt, the writer/lease fields and the revision change, and reports the
+model it used plus the per-byte sensitivity of the writer and operation ids.
+With writer/revision/operation arguments it uses the commit planner and the
+resulting byte count equals the following commit's byte count for the same
+arguments on an unchanged document.  `capacity` also reports, per record class
+(evidence, correction, task, acceptance, decision, blocker, operation receipt
+and a full resume/save cycle), the marginal document bytes and the marginal
+object-store bytes, so growth is measured rather than assumed.  Externalising a
+collection removes its growth from the document but not its growth in the object
+store.
 
 
 ### Long-running projects

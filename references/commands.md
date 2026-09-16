@@ -85,6 +85,73 @@ pause ongoing edits and do not dual-write both authorities during that cutover.
 `compact` without writer/revision/operation arguments is a read-only size
 estimate excluding the next operation. Supply all three arguments (and omit
 `--apply`) to validate lease, CAS and the complete candidate using the same
-planner as the commit. Full `migrate --to-v3` previews additionally require
+planner as the commit; the measured preview and the following commit produce
+identical byte counts for identical arguments on an unchanged document. Full `migrate --to-v3` previews additionally require
 `--source-sha256`. Previews do not create locks, archives or history. Apply
 always rereads under lock; a preview is not a reservation or drift approval.
+
+### v4 external evidence objects
+
+```bash
+# Explicit, dry-run-first upgrade of a v2/v3 document.  After --apply the
+# project keeps writing v4; objects are published and fsynced before the
+# history snapshot and the CURRENT replacement, never after it.
+python scripts/write_current.py migrate --root <project> --to-v4
+python scripts/write_current.py migrate --root <project> --to-v4 --apply \
+  --source-sha256 <hash-from-dry-run> \
+  --writer <writer-id> --expected-revision <n> --operation-id <unique-id> \
+  [--allow-drift] [--lease-minutes <n>]
+
+# Read-only derived views: no state, no second authority, no writes.
+# coverage reports the evidence x acceptance matrix from the shared judgement;
+# every row separates recorded coverage from current coverage and from a
+# verified baseline.
+python scripts/write_current.py coverage --root <project> [--task <id>] [--limit 20]
+
+# handoff pages tasks, blockers, uncovered acceptance and evidence separately
+# and reports total/has_more for each.  complete=false whenever any page is
+# truncated, so a truncated read can never look like a successful handoff.
+python scripts/write_current.py handoff  --root <project> [--task <id>] [--limit 25] [--offset 0] \
+  [--uncovered-limit <n>] [--uncovered-offset <n>]
+
+# capacity also reports a modelled next commit (including its own operation
+# receipt, writer and lease) and the marginal cost of one more record of each
+# class under "growth".
+python scripts/write_current.py capacity --root <project>
+
+# With all three transaction arguments, capacity uses the complete commit
+# planner for the realistic next write (a resume) and reports the objects the
+# next commit would publish:
+python scripts/write_current.py capacity --root <project> \
+  --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
+```
+
+A v4 write commits CURRENT.md at or below 32768 bytes.  `capacity` always
+carries the next operation receipt in its model; a preview that omitted the
+operation metadata is never presented as proof that the next commit fits.
+`handoff` fails by name when a bound object or index reference is missing; it
+never emits a successful handoff.  A missing or damaged object is reported
+read-only as degraded and blocks mutation; an exhausted deep check is an
+incomplete check and is never a PASS.
+
+Correction targets whose bytes live outside the document (`target_type`
+`chunk_manifest`) are verified against the real object before anything is
+published and re-verified inside the write lock.  Every other manifest-shaped
+target type is refused by name with RELAY_CORRECTION_TARGET_UNSUPPORTED.
+
+Before the first v4 object write, confirm the relay is protected by local
+ignore rules (`git check-ignore`, `git status --porcelain -- .relay`,
+`git ls-files .relay`) and that no writer lease is live.
+
+### Independent migration comparison
+
+```bash
+python scripts/migrate_compare.py --before <pre-CURRENT.md> \
+  --after <post-CURRENT.md> [--root <project>]
+```
+
+Exit status 0 means logically equivalent; 1 means a business difference was
+found (reported per record collection); 2 means the documents could not be
+compared.  Only the schema, storage references, managed metadata, revision,
+timestamps, lease and this operation receipt may differ; business fields are
+never on an ignore list.

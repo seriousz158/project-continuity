@@ -99,7 +99,11 @@ class CapacityTests(unittest.TestCase):
         receipt = next((self.root / ".relay/receipts").iterdir())
         receipt.write_text(receipt.read_text(encoding="utf-8") + "tamper\n", encoding="utf-8")
         status = self.call("status")[1]
-        self.assertEqual(status["verification"], "DEGRADED")
+        # A degraded archive is named by its own check and never yields a
+        # verified conclusion; the top-level word is the verification verdict.
+        self.assertEqual(status["verification"], "unverified")
+        self.assertEqual(status["archive_integrity"], "invalid")
+        self.assertFalse(status["checks"]["integrity"]["verified"])
         self.assertFalse(status["write_ready"])
         self.assertEqual(self.call("validate")[0], 2)
         self.assertEqual(self.call("resume", "--writer", "b", "--expected-revision", "38",

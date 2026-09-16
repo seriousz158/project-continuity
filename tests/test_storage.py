@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -280,5 +282,111 @@ with s.locked(pathlib.Path(sys.argv[2])):
         self.assertTrue(acquired.exists())
 
 
+class PublicationWindowTests(unittest.TestCase):
+    """A live publish window is waited out; a foreign or stuck link is refused.
+
+    A creator links its finished temporary file as the target and then unlinks
+    the temporary name.  During that window the target has two links.  The read
+    path must wait for the window to close inside ``PUBLISH_WAIT_SECONDS``, and
+    the write path must treat an already published identical object as
+    idempotent -- while a foreign hard link, or a window that never closes, is
+    refused by name without spending the wait budget.
+    """
+
+    DEADLINE = 0.15
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+
+    def window(self, target, name, delay=0.05):
+        """Hold a second link to *target* and release it after *delay* seconds."""
+        temporary = target.parent / name
+        os.link(target, temporary)
+        timer = threading.Timer(delay, lambda: temporary.unlink(missing_ok=True))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        self.addCleanup(lambda: temporary.unlink(missing_ok=True))
+        return temporary
+
+    def foreign(self, target, name="elsewhere.bin"):
+        """A second link that is not this protocol temporary name."""
+        linked = target.parent / name
+        os.link(target, linked)
+        self.addCleanup(lambda: linked.unlink(missing_ok=True))
+        return linked
+
+    def test_read_waits_out_a_live_publication_window(self):
+        target = self.root / "payload.bin"
+        target.write_bytes(b"window payload")
+        self.window(target, "." + target.name + ".101.tmp")
+        self.assertEqual(storage.read(target), "window payload")
+
+    def test_read_honours_an_explicit_temporary_pattern(self):
+        target = self.root / "payload.bin"
+        target.write_bytes(b"window payload")
+        self.window(target, ".custom-987.tmp")
+        self.assertEqual(storage.read(target, temporary_pattern=".custom-*.tmp"),
+                         "window payload")
+
+    def test_read_refuses_a_window_that_never_closes(self):
+        target = self.root / "payload.bin"
+        target.write_bytes(b"window payload")
+        self.window(target, "." + target.name + ".102.tmp", delay=30)
+        with mock.patch.object(storage, "PUBLISH_WAIT_SECONDS", self.DEADLINE):
+            with self.assertRaises(storage.Error) as caught:
+                storage.read(target)
+        self.assertIn("publication window", str(caught.exception))
+
+    def test_read_refuses_a_foreign_hard_link_without_waiting(self):
+        target = self.root / "payload.bin"
+        target.write_bytes(b"window payload")
+        self.foreign(target)
+        with mock.patch.object(storage, "PUBLISH_WAIT_SECONDS", 30.0):
+            started = time.monotonic()
+            with self.assertRaises(storage.Error) as caught:
+                storage.read(target)
+            self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn("exactly one link", str(caught.exception))
+
+    def test_write_is_idempotent_through_a_live_publication_window(self):
+        target = self.root / "object.bin"
+        payload = b"identical payload"
+        target.write_bytes(payload)
+        self.window(target, "." + target.name + ".201.tmp")
+        self.assertEqual(storage.immutable_bytes(target, payload), [])
+        self.assertEqual(storage.read_bytes(target, max_bytes=4096), payload)
+
+    def test_write_names_a_conflict_once_the_window_closes(self):
+        target = self.root / "object.bin"
+        target.write_bytes(b"first")
+        self.window(target, "." + target.name + ".202.tmp")
+        with self.assertRaises(storage.Error) as caught:
+            storage.immutable_bytes(target, b"second")
+        self.assertIn("conflict", str(caught.exception))
+
+    def test_write_refuses_a_window_that_never_closes(self):
+        target = self.root / "object.bin"
+        target.write_bytes(b"payload")
+        self.window(target, "." + target.name + ".203.tmp", delay=30)
+        with mock.patch.object(storage, "PUBLISH_WAIT_SECONDS", self.DEADLINE):
+            with self.assertRaises(storage.Error) as caught:
+                storage.immutable_bytes(target, b"payload")
+        self.assertIn("did not settle", str(caught.exception))
+
+    def test_write_refuses_a_foreign_hard_link_without_waiting(self):
+        target = self.root / "object.bin"
+        target.write_bytes(b"payload")
+        self.foreign(target)
+        with mock.patch.object(storage, "PUBLISH_WAIT_SECONDS", 30.0):
+            started = time.monotonic()
+            with self.assertRaises(storage.Error) as caught:
+                storage.immutable_bytes(target, b"payload")
+            self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn("exactly one link", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
+
