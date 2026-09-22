@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.4.0 - 2026-09-21
+
+Relay capacity and deep-check round.
+
+- Repair the deep integrity check.  `handoff --verify-integrity` and
+  `coverage --verify-integrity` called an undefined `object_integrity` and
+  raised `NameError`; both entry points now run the real deep check through
+  `resolve`.  Every reachable object and index node is read and verified:
+  content digest, object type and format, schema, project identity, index
+  count/digest and the ordered binding of every record.  A missing, tampered,
+  wrong-type, cross-project or cyclic object is refused by its named code; a
+  check that exhausts its validation budget is reported as `budget_exceeded`
+  (an incomplete check that can never be a pass); a schema without an object
+  store is reported as `not_applicable`, never as verified.  A deep check that
+  was requested is part of the required set of the verification record, so its
+  degradation can no longer be absorbed into a verified conclusion.
+- Check the acceptance map against the tasks.  The deep check re-derives
+  `ac_map` from the acceptance conditions and refuses a document whose map has
+  been rebound to different text (`RELAY_AC_MAP_MISMATCH`).
+- Add schema `project-continuity/v5`: the project's custom Markdown and its
+  acceptance map move into the content-addressed object store.  The document
+  keeps a compact stub (section list, content digests, source revision and the
+  restore command) plus two index references.  Resolving a v5 document produces
+  exactly the logical state its v4 predecessor produced, and the original
+  Markdown is reconstructed byte for byte by
+  `write_current.py markdown --root <project>`.  `migrate --to-v5` is a dry
+  run unless `--apply` is present, binds the exact source SHA-256, and never
+  re-runs a completed v4 migration.  Older clients refuse v5 by name and cannot
+  write to it.
+- Keep the capacity contract.  32 KiB stays the hard v4/v5 document limit; the
+  24 KiB size is an observation target that is now met and modelled rather than
+  assumed.
+- Add a uniform capacity receipt to every successful mutation.  `resume`,
+  `update`, `save`, `compact` and `migrate` now report an additive `capacity`
+  block: `used_bytes`, `limit_bytes`, `headroom_bytes`, `delta_bytes` (the
+  CURRENT.md net change, which may be negative), `near_limit`,
+  `recommended_action`, `object_store_new_bytes` (kept separate from
+  `delta_bytes`) and `next_save_cycle_estimate`.  The estimate names its
+  writer/operation-id/clock assumptions and what would invalidate it, or is
+  reported as `not_computed` with a reason.  It is computed after a successful
+  commit and never turns it into a failure; an idempotent replay reports the
+  current occupancy with `committed=false`/`replayed=true`, never a fresh commit.
+- Add a read-only patch preview.  `capacity --input change.json` reuses the
+  commit planner, applies the real typed upsert and models `resume -> save`
+  (no lease) or the lease holder's `save`.  It creates no lock, lease, object,
+  receipt or history and never changes `CURRENT.md`; another writer's live lease
+  is refused by name (`RELAY_PREVIEW_LEASE_CONFLICT`).  With a fixed input,
+  state, clock and identity the predicted byte count equals the commit's.
+- Add non-blocking long-record hints.  `capacity [--long-record-threshold N]`
+  locates a large field by collection, record id, field and UTF-8 byte size
+  without echoing the value; evidence `result` is an enum and is not treated as
+  prose.  Hints never truncate, externalise or change the hard limit.  The
+  docs and examples now recommend pointer-style records: keep identity, result,
+  baseline and the acceptance linkage in `CURRENT.md`, and the detail in an
+  evidence root.  A protocol object reference is provable by the resolver; a
+  plain path is only a pointer and never proof that content was verified.
+- Clarify the external Markdown provenance.  `extensions.external_markdown.
+  source_revision` is the revision the text was first externalised from; a later
+  content change updates `bytes`/`sections`/`text_sha256` but never advances it.
+  The `markdown` command reports a `provenance_meaning` object so a consumer
+  judges freshness by content identity and never reports the text as stale
+  merely because `source_revision` is smaller than the current revision.
+
 ## 0.3.3 - 2026-09-16
 
 Second review follow-up: the publication-window repair is live code, the write

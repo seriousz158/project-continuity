@@ -25,6 +25,8 @@ import progress as p
 import storage as fs
 from relay_errors import (
     RelayError,
+    RELAY_AC_MAP_MISMATCH,
+    RELAY_MARKDOWN_DIGEST_MISMATCH,
     RELAY_PAGE_CURSOR_STALE,
     RELAY_CORRECTION_TARGET_UNSUPPORTED,
     RELAY_CORRECTION_TARGET_UNREACHABLE,
@@ -32,6 +34,7 @@ from relay_errors import (
     RELAY_OBJECT_SCHEMA_INVALID,
     RELAY_OBJECT_TYPE_INVALID,
     RELAY_SCHEMA_V4_REQUIRES_RESOLVER,
+    RELAY_VALIDATION_BUDGET_EXCEEDED,
 )
 
 V4 = p.SCHEMA_V4
@@ -83,7 +86,7 @@ def resolve(document_text, project_root=None):
         return None
     if schema in (p.SCHEMA_V2, p.SCHEMA_V3):
         return stub
-    if schema != V4:
+    if schema not in EXTERNAL_SCHEMAS:
         raise RelayError(RELAY_OBJECT_SCHEMA_INVALID, "unsupported relay schema")
     return expand(stub, project_root, meta["project_id"])
 
@@ -92,9 +95,9 @@ def expand(stub, project_root, project_id, budget=None):
     """Reconstruct the complete logical state from the bound objects."""
     if project_root is None:
         raise RelayError(RELAY_SCHEMA_V4_REQUIRES_RESOLVER,
-                         "a v4 document requires an explicit project root")
+                         "an external document requires an explicit project root")
     _require(isinstance(stub, dict) and p.is_external(stub),
-             "v4 expansion requires an external evidence index")
+             "expansion requires an external evidence index")
     root = fs.root_path(project_root)
     budget = budget if budget is not None else obs.Budget()
     full = copy.deepcopy(stub)
@@ -102,8 +105,74 @@ def expand(stub, project_root, project_id, budget=None):
     if "corrections" in stub:
         full["corrections"] = _collect_ref(root, project_id, "correction",
                                            stub["corrections"], budget)
+    if "ac_map" in stub:
+        # The map is bound to the task acceptance identities it was minted for:
+        # a task change makes the bound record invalid rather than silently
+        # reused, and the resolved state carries the map in its v4 location.
+        records = _collect_ref(root, project_id, "ac-map", stub["ac_map"], budget)
+        _require(len(records) == 1, "the acceptance map collection must hold one record")
+        record = records[0]
+        _require(isinstance(record, dict)
+                 and set(record) == {"id", "tasks_digest", "map"},
+                 "the acceptance map record is invalid")
+        if record["tasks_digest"] != p.digest(stub["tasks"]):
+            raise RelayError(RELAY_AC_MAP_MISMATCH,
+                             "the acceptance map is not bound to these acceptance conditions")
+        if record["map"] != p.build_ac_map(stub["tasks"]):
+            raise RelayError(RELAY_AC_MAP_MISMATCH,
+                             "the acceptance map disagrees with the task acceptance conditions")
+        full["extensions"]["ac_map"] = record["map"]
+        full.pop("ac_map", None)
+    if "markdown" in stub:
+        # Validated here so a deep read covers the externalised text; the
+        # logical state deliberately keeps the v4 shape and the text is
+        # reconstructed by resolve_markdown().
+        records = _collect_ref(root, project_id, "markdown", stub["markdown"], budget)
+        p.validate_markdown(records)
+        provenance = stub.get("extensions", {})
+        provenance = (provenance.get("external_markdown")
+                      if isinstance(provenance, dict) else None)
+        if isinstance(provenance, dict) \
+                and obs.is_hex64(provenance.get("text_sha256") or ""):
+            # The document declares the digest of the whole externalised text;
+            # the bound objects must still reproduce it.
+            if provenance["text_sha256"] != p.markdown_text_digest(records):
+                raise RelayError(
+                    RELAY_MARKDOWN_DIGEST_MISMATCH,
+                    "the externalised Markdown does not match the document digest")
+        full.pop("markdown", None)
     p.validate(full, make_target_resolver(root, project_id, stub, budget))
     return full
+
+
+def collect_markdown(stub, project_root, project_id, budget=None):
+    """The ordered external Markdown records of a v5 document."""
+    _require(isinstance(stub, dict) and isinstance(stub.get("markdown"), dict),
+             "this document does not externalise its Markdown")
+    root = fs.root_path(project_root)
+    budget = budget if budget is not None else obs.Budget()
+    records = _collect_ref(root, project_id, "markdown", stub["markdown"], budget)
+    p.validate_markdown(records)
+    return records
+
+
+def resolve_markdown(document_text, project_root=None):
+    """The exact custom Markdown text of a document, v4 or v5.
+
+    For v5 the text is reconstructed byte for byte from the bound objects; for
+    v4 and earlier it is the unmanaged region of the document itself.
+    """
+    meta, body = parse_envelope(document_text)
+    if meta["schema"] != p.SCHEMA_V5:
+        return p.custom_region(body)
+    if project_root is None:
+        raise RelayError(RELAY_SCHEMA_V4_REQUIRES_RESOLVER,
+                         "a v5 document requires an explicit project root")
+    _meta, stub, _matches = envelope_state(document_text)
+    if not isinstance(stub.get("markdown"), dict):
+        return ""
+    records = collect_markdown(stub, project_root, meta["project_id"])
+    return p.join_markdown(records)
 
 
 def _collect_ref(root, project_id, record_type, ref, budget):
@@ -118,8 +187,72 @@ def _collect_ref(root, project_id, record_type, ref, budget):
     return records
 
 
-def plan_full(state, root, project_id, targets=None):
-    """Return (stub_state, publish_plans); never touches the filesystem."""
+# Schemas whose committed state depends on the external object store.  Every
+# document in one of these schemas is deep-checked; every other schema reports
+# the check as not applicable rather than as a pass.
+EXTERNAL_SCHEMAS = tuple(s for s in (p.SCHEMA_V4, getattr(p, "SCHEMA_V5", None)) if s)
+
+OBJECT_CHECK_SCOPE = "every reachable evidence, correction and markdown object"
+OBJECT_CHECK_LIMITS = ("external_references", "seal_bytes", "test_suites",
+                       "provider_calls", "network")
+
+
+def object_integrity(root, project_id, stub, schema, budget=None):
+    """Read every reachable object and verify its identity (an explicit deep check).
+
+    The outcome vocabulary is deliberately narrow and never optimistic:
+
+      * verified        — every reachable object and index node was read, its
+                          bytes matched its digest, and its type, schema,
+                          project id and index binding agreed;
+      * degraded        — a named corruption (missing, tampered, wrong type,
+                          cross-project, cyclic, invalid index, or an
+                          acceptance map that no longer matches the tasks);
+      * budget_exceeded — the check did not finish: INCOMPLETE, never a pass;
+      * not_applicable  — a schema with no object store: never a pass either.
+
+    The check is only ever executed when a caller explicitly asks for it.
+    """
+    if schema not in EXTERNAL_SCHEMAS or not isinstance(stub, dict) \
+            or not p.is_external(stub):
+        return {"checked": False, "state": "not_applicable",
+                "reason": "integrity_not_applicable_to_schema",
+                "applicable": False, "objects_checked": 0, "verified": False,
+                "schema": schema, "scope": OBJECT_CHECK_SCOPE,
+                "does_not_cover": list(OBJECT_CHECK_LIMITS)}
+    budget = budget if budget is not None else obs.Budget()
+    start = budget.files
+    common = {"checked": True, "applicable": True, "schema": schema,
+              "scope": OBJECT_CHECK_SCOPE, "does_not_cover": list(OBJECT_CHECK_LIMITS)}
+    try:
+        expand(stub, root, project_id, budget)
+        reachable_manifest_digests(root, project_id, stub, budget)
+        declared = stub.get("extensions", {})
+        declared = declared.get("ac_map") if isinstance(declared, dict) else None
+        if declared is not None and declared != p.build_ac_map(stub["tasks"]):
+            raise RelayError(RELAY_AC_MAP_MISMATCH,
+                             "the acceptance map disagrees with the task acceptance conditions")
+    except RelayError as exc:
+        state = ("budget_exceeded" if exc.code == RELAY_VALIDATION_BUDGET_EXCEEDED
+                 else "degraded")
+        return dict(common, state=state, reason=exc.code,
+                    objects_checked=budget.files - start, verified=False)
+    except (p.Invalid, fs.Error, OSError, UnicodeError, ValueError, TypeError, KeyError):
+        return dict(common, state="degraded", reason=RELAY_OBJECT_SCHEMA_INVALID,
+                    objects_checked=budget.files - start, verified=False)
+    return dict(common, state="verified", reason=None,
+                objects_checked=budget.files - start, verified=True,
+                index=stub["evidence"].get("index"),
+                count=stub["evidence"].get("count"))
+
+
+def plan_full(state, root, project_id, targets=None, markdown=None, source_revision=None):
+    """Return (stub_state, publish_plans); never touches the filesystem.
+
+    Passing the custom Markdown records selects the v5 representation: the text
+    and the acceptance map become external collections bound by an index
+    reference, and the document keeps only the compact stub.
+    """
     p.validate(state, targets)
     _require(not p.is_external(state), "v4 planning requires resolved records")
     plans, texts, evidence_entries = [], [], []
@@ -148,7 +281,52 @@ def plan_full(state, root, project_id, targets=None):
                                    p.digest(list(state["evidence"])))
     stub["corrections"] = p.index_ref(correction_sha, len(correction_entries),
                                       p.digest(corrections))
-    stub["extensions"]["ac_map"] = p.build_ac_map(stub["tasks"])
+    if markdown is None:
+        stub["extensions"]["ac_map"] = p.build_ac_map(stub["tasks"])
+    else:
+        p.validate_markdown(markdown)
+        markdown_entries = []
+        for record in markdown:
+            entry, part = obs.entry_for(root, project_id, "markdown", record)
+            markdown_entries.append(entry)
+            plans.extend(part)
+            texts.append(obs.envelope_text(project_id, "markdown", record))
+        markdown_plans, markdown_sha = obs.plan_index(root, project_id, "markdown",
+                                                      markdown_entries)
+        plans.extend(markdown_plans)
+        stub["markdown"] = p.index_ref(markdown_sha, len(markdown_entries),
+                                       p.digest(list(markdown)))
+        # One immutable record per acceptance identity, bound to the digest of
+        # the acceptance conditions it was minted from: rebinding the map to a
+        # changed task set publishes a new object instead of reusing a stale one.
+        tasks_digest = p.digest(stub["tasks"])
+        map_record = {"id": "ac-map-" + tasks_digest[:16], "tasks_digest": tasks_digest,
+                      "map": p.build_ac_map(stub["tasks"])}
+        map_entry, map_plans = obs.entry_for(root, project_id, "ac-map", map_record)
+        plans.extend(map_plans)
+        texts.append(obs.envelope_text(project_id, "ac-map", map_record))
+        map_index_plans, map_index_sha = obs.plan_index(root, project_id, "ac-map",
+                                                        [map_entry])
+        plans.extend(map_index_plans)
+        stub["ac_map"] = p.index_ref(map_index_sha, 1, p.digest([map_record]))
+        # The map moves from extensions.ac_map to the external collection: a
+        # document may never carry both, so the inline copy is removed here.
+        stub["extensions"].pop("ac_map", None)
+        provenance = stub["extensions"].get("external_markdown")
+        if not isinstance(provenance, dict) \
+                or provenance.get("schema") != p.EXTERNAL_MARKDOWN_SCHEMA:
+            provenance = p.external_markdown_metadata(
+                source_revision if source_revision is not None else 0, markdown)
+        else:
+            # The provenance keeps the revision the text was first
+            # externalised from, but every derived value is recomputed: a
+            # section added or replaced in this commit changes the corpus and
+            # therefore its declared digest.
+            provenance = dict(provenance)
+        provenance["sections"] = len(markdown)
+        provenance["bytes"] = sum(record["bytes"] for record in markdown)
+        provenance["text_sha256"] = p.markdown_text_digest(markdown)
+        stub["extensions"]["external_markdown"] = provenance
     p.validate(stub)
     return stub, plans, texts
 
@@ -356,8 +534,17 @@ def _verification_record(checks, complete=True):
     # "covered" and "not_required" are passing outcomes: their names describe the
     # result, not a failure.  The explicit verified flag on each check is the one
     # source of that judgement.
+    required = list(MANDATORY_CHECKS)
+    integrity = checks.get("integrity")
+    if isinstance(integrity, dict) and integrity.get("checked") \
+            and integrity.get("applicable", True):
+        # A deep check that was explicitly requested is part of the required set
+        # for this conclusion: degrading or exhausting it can never be absorbed
+        # into a verified handoff.
+        required.append("integrity")
+    required.sort(key=lambda name: CHECK_ORDER.index(name) if name in CHECK_ORDER else 99)
     failures = [(name, check) for name, check in checks.items()
-                if name in MANDATORY_CHECKS and check.get("applicable", True)
+                if name in required and check.get("applicable", True)
                 and not check.get("verified")
                 and _check_state(check) != "not_required"]
     failures.sort(key=lambda item: CHECK_ORDER.index(item[0])
@@ -381,7 +568,7 @@ def _verification_record(checks, complete=True):
                             if verified else "not verified: " + str(reason))}
     return {"schema": "project-continuity/verification-record/v1", "verified": verified,
             "reason": reason, "complete": complete, "checks": checks,
-            "required": list(MANDATORY_CHECKS), "not_checked": not_checked,
+            "required": required, "not_checked": not_checked,
             "scope": scope, "basis": "read_only_local"}
 
 def _describe(row, position):

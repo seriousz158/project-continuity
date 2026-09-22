@@ -89,6 +89,54 @@ Optional v4 extensions:
     satisfies a completion gate; coverage and handoff apply the same judgement,
     and the target records stay queryable.  See "Effective evidence" below.
 
+## v5 external Markdown and acceptance map
+
+Schema "project-continuity/v5" is a second explicit upgrade, reached only
+through "migrate --to-v5" from a v4 document.  It externalises two more
+collections that a long-lived project accumulates:
+
+    CURRENT.md -> markdown index ref -> immutable section objects
+    CURRENT.md -> ac_map index ref   -> one immutable acceptance-map record
+
+The unmanaged Markdown region of the document is replaced by a compact stub
+that lists each section with its stable id, byte length and content digest, and
+that names the restore path and the source revision.  Nothing is deleted:
+joining the stored sections in ordinal order reproduces the previous region
+byte for byte, and the "markdown" command prints the restored text together
+with the digest of the whole text so the restore can be verified.
+
+`extensions.external_markdown.source_revision` is the revision the text was
+**first** externalised from.  A later section add or replace updates the bound
+`bytes`, `sections` and `text_sha256` but never advances `source_revision`, so a
+consumer must judge freshness by the content identity (`sha256`/`bytes`/
+`sections`) and must not report the Markdown as stale merely because
+`source_revision` is smaller than the current revision.  The `markdown` command
+reports a `provenance_meaning` object that states this contract.
+
+The acceptance map keeps its v4 meaning: stable acceptance identifiers derived
+from the task id and the condition text, in task order.  Its record is bound to
+the digest of the acceptance conditions it was minted from, so a task change
+publishes a new record instead of reusing a stale map, and a document whose
+bound map no longer matches its tasks is refused by name
+(RELAY_AC_MAP_MISMATCH).
+
+Resolution keeps its shape and its result:
+
+    resolve(document_text, project_root) -> complete logical state
+
+A v5 document resolves to exactly the logical state its v4 predecessor
+resolved to: the acceptance map returns to "extensions.ac_map" and the
+Markdown text is reconstructed separately by resolve_markdown() or the
+"markdown" command.  Both new collections use the existing object, index and
+budget machinery, so v5 inherits the named corruption codes and the rule that
+an exhausted budget is an incomplete check and never a pass.  A build that does
+not implement v5 refuses the document by name and writes nothing.
+
+The document limit is unchanged: 32768 bytes (V4_MAX_BYTES) remains the hard
+limit for v4 and v5, the 64 KiB protocol ceiling is untouched, and the 24576
+byte governance target stays an observation target rather than a limit that
+would justify dropping history.
+
 ## Effective evidence and correction targets
 
 Four judgements are kept separate and never substitute for each other:
@@ -260,6 +308,35 @@ Markdown remains unchanged. Compact previews without operation parameters are
 estimates and exclude the new operation metadata, not commit guarantees.
 Fully parameterized previews use the commit planner without writing files;
 apply repeats validation under lock.
+
+Every successful mutation reports an additive `capacity` receipt.  `delta_bytes`
+is the net CURRENT.md change only (and may be negative after compaction);
+object-store bytes are reported separately as `object_store_new_bytes` and are
+never added into `delta_bytes`.  `recommended_action` names the next sensible
+step ("none", compact/migrate, or a replay note).  `next_save_cycle_estimate`
+models the next ordinary resume->save cycle with its writer, operation-id,
+lease and clock assumptions and names what would invalidate it; when it cannot
+be built the estimate is reported as `not_computed` with a reason rather than a
+reassuring zero.  The receipt is computed after a successful commit and never
+turns it into a failure.  An idempotent replay reports the current observed
+occupancy with `committed=false`/`replayed=true` and no fresh `delta_bytes`.
+
+`capacity --input` is a read-only preview of a real typed patch that reuses the
+commit planner (so a fixed input, state, clock and identity predicts the exact
+commit bytes).  It creates no lock, lease, object, receipt or history, never
+changes CURRENT.md and never initialises `.relay`.  A live lease held by another
+writer is refused by name (`RELAY_PREVIEW_LEASE_CONFLICT`) instead of being
+predicted; a preview is never a reservation, and apply always rereads under the
+lock.
+
+A long-record hint is a non-blocking, read-only diagnostic measured in UTF-8
+bytes.  It names the collection, record id, field and size and never echoes the
+value, never truncates or externalises content, and never changes the hard
+capacity limit.  Evidence `result` is an enum and is not treated as prose.
+Detailed logs, matrices and report bodies belong in an evidence root; relay
+state keeps identity, result, baseline and the acceptance linkage.  A protocol
+object reference is provable by the resolver, while a plain file path is only a
+pointer and is never proof that the content was verified.
 
 `capacity` never presents an estimate that omits the next operation metadata as
 proof that the next commit fits.  Its estimate models a resume, including the

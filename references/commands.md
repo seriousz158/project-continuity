@@ -33,9 +33,23 @@ python scripts/write_current.py compact --root <project>
 python scripts/write_current.py compact --apply --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
 
+# Read-only: the exact custom Markdown of a document (v4 or v5).  For v5 the
+# text is rebuilt byte for byte from the bound objects and the digest of the
+# whole text (and of each section) is reported, so a restore can be verified.
+python scripts/write_current.py markdown --root <project>
+python scripts/write_current.py markdown --root <project> --section <md-id>
+
 # Migration is a dry run unless --apply is present
 python scripts/write_current.py migrate --root <project>
 python scripts/write_current.py migrate --root <project> --apply \
+  --source-sha256 <hash-from-dry-run> \
+  --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
+
+# Externalise the custom Markdown and the acceptance map (v4 -> v5).  A dry
+# run reports the candidate size and the exact source SHA-256 that --apply
+# requires; the v4 migration is never repeated.
+python scripts/write_current.py migrate --root <project> --to-v5
+python scripts/write_current.py migrate --root <project> --to-v5 --apply \
   --source-sha256 <hash-from-dry-run> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
 
@@ -124,7 +138,28 @@ python scripts/write_current.py capacity --root <project>
 # next commit would publish:
 python scripts/write_current.py capacity --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
+
+# Read-only preview of a real typed patch. With no live lease it models
+# resume->save; while --writer holds the lease it models that writer's save.
+# Another writer's live lease is refused by name (RELAY_PREVIEW_LEASE_CONFLICT).
+# It creates no lock, lease, object, receipt or history and never changes
+# CURRENT.md; the real commit rereads and revalidates under the lock.
+python scripts/write_current.py capacity --root <project> \
+  --writer <writer-id> --input change.json
+
+# A non-blocking long-record hint locates a large field by collection/id/field
+# and byte size; it never echoes the value and never truncates or externalises.
+python scripts/write_current.py capacity --root <project> --long-record-threshold 4096
 ```
+
+Every successful mutation additionally reports an additive `capacity` block:
+`used_bytes`, `limit_bytes`, `headroom_bytes`, `delta_bytes` (CURRENT.md only,
+may be negative), `near_limit`, `recommended_action`, `object_store_new_bytes`
+(kept separate from `delta_bytes`) and `next_save_cycle_estimate` (the next
+ordinary resume->save cycle, with its writer/operation/clock assumptions, or a
+named `not_computed` reason). An idempotent replay reports the current
+occupancy with `committed=false` and `replayed=true`; it is never presented as
+a fresh commit.
 
 A v4 write commits CURRENT.md at or below 32768 bytes.  `capacity` always
 carries the next operation receipt in its model; a preview that omitted the

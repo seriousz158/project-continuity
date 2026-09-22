@@ -23,9 +23,17 @@ SCHEMA = "project-continuity/v2"
 SCHEMA_V2 = SCHEMA
 SCHEMA_V3 = "project-continuity/v3"
 SCHEMA_V4 = "project-continuity/v4"
-SUPPORTED_SCHEMAS = (SCHEMA_V2, SCHEMA_V3, SCHEMA_V4)
+# v5 keeps the v4 object model and externalises two more collections: the
+# project's custom Markdown sections and the acceptance map.  Resolving a v5
+# document produces exactly the logical state its v4 predecessor produced; only
+# the on-disk representation changes, and old clients refuse v5 by name.
+SCHEMA_V5 = "project-continuity/v5"
+SUPPORTED_SCHEMAS = (SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5)
 RECEIPT_SCHEMA = "project-continuity/receipts/v1"
 AC_MAP_SCHEMA = "project-continuity/ac-map/v1"
+MARKDOWN_SCHEMA = "project-continuity/markdown/v1"
+EXTERNAL_MARKDOWN_SCHEMA = "project-continuity/external-markdown/v1"
+MARKDOWN_ID_PREFIX = "md-"
 BLOCKER_SCOPE_SCHEMA = "project-continuity/blocker-scope/v1"
 HANDOFF_VIEW_SCHEMA = "project-continuity/handoff-view/v1"
 MAX_BYTES = 65536
@@ -138,9 +146,14 @@ def keyed(rows, label):
 
 def budget(schema):
     """Return (document limit, compaction trigger, compaction target)."""
-    if schema == SCHEMA_V4:
+    if schema in (SCHEMA_V4, SCHEMA_V5):
         return V4_MAX_BYTES, V4_COMPACTION_TRIGGER_BYTES, V4_COMPACTION_TARGET_BYTES
     return MAX_BYTES, COMPACTION_TRIGGER_BYTES, COMPACTION_TARGET_BYTES
+
+
+def is_external_schema(schema):
+    """Schemas whose committed logical state lives in the object store."""
+    return schema in (SCHEMA_V4, SCHEMA_V5)
 
 
 def is_external(state):
@@ -205,6 +218,214 @@ def _validate_ac_map(value):
                 "invalid acceptance map entry")
         require(entry["ac_id"] not in seen, "duplicate acceptance identifier")
         seen.add(entry["ac_id"])
+
+
+MARKDOWN_STUB_HEADING = "## 交接摘要（自定义 Markdown 已外置 · schema v5）"
+MARKDOWN_PREAMBLE_TITLE = "(preamble)"
+MARKDOWN_MAX_BYTES = 262144
+
+
+def markdown_identifier(title):
+    """A stable ASCII id for one custom Markdown section."""
+    return MARKDOWN_ID_PREFIX + hashlib.sha256(title.encode("utf-8")).hexdigest()[:16]
+
+
+def markdown_title(value):
+    require(isinstance(value, str) and value.strip(), "markdown title must be text")
+    require(len(value) <= 256 and "\n" not in value and "\r" not in value
+            and "<!-- project-continuity:" not in value and "\x7f" not in value,
+            "markdown title contains unsupported content")
+    require(not value.startswith(MARKDOWN_ID_PREFIX) or value == MARKDOWN_PREAMBLE_TITLE,
+            "markdown title collides with a managed identifier")
+
+
+def markdown_content(value, allow_blank=False):
+    require(isinstance(value, str), "markdown content must be text")
+    if not allow_blank:
+        require(bool(value.strip()), "markdown content must be text")
+    require(len(value.encode("utf-8")) <= MARKDOWN_MAX_BYTES,
+            "markdown section is too large")
+    require("\x7f" not in value and "<!-- project-continuity:" not in value,
+            "markdown content contains unsupported content")
+
+
+def validate_markdown(records):
+    """Ordered, content-addressed custom Markdown sections.
+
+    The text is reconstructed verbatim by joining the records in ordinal order,
+    so every record carries the digest and byte length of its own content and
+    the sequence is complete and gapless.
+    """
+    require(isinstance(records, list), "markdown must be a list")
+    seen, titles = set(), set()
+    for position, record in enumerate(records):
+        require(isinstance(record, dict) and set(record) == {
+            "id", "ordinal", "title", "content", "sha256", "bytes"},
+            "invalid markdown record")
+        require(type(record["ordinal"]) is int and record["ordinal"] == position,
+                "markdown records are not in order")
+        markdown_title(record["title"])
+        identifier(record["id"])
+        require(record["id"] == markdown_identifier(record["title"]),
+                "markdown identifier does not match its title")
+        markdown_content(record["content"],
+                         allow_blank=record["title"] == MARKDOWN_PREAMBLE_TITLE)
+        raw = record["content"].encode("utf-8")
+        require(record["sha256"] == hashlib.sha256(raw).hexdigest(),
+                "markdown content hash mismatch")
+        require(type(record["bytes"]) is int and record["bytes"] == len(raw),
+                "markdown byte length mismatch")
+        require(record["id"] not in seen, "duplicate markdown identifier")
+        require(record["title"] not in titles, "duplicate markdown section title")
+        seen.add(record["id"])
+        titles.add(record["title"])
+    return records
+
+
+def custom_region(body):
+    """The unmanaged Markdown region of a body: everything before the data block."""
+    position = body.find(DATA_START)
+    require(position >= 0, "missing managed data section")
+    return body[:position]
+
+
+def render_region(body, region):
+    """Replace the unmanaged region, leaving both managed blocks byte-identical."""
+    position = body.find(DATA_START)
+    require(position >= 0, "missing managed data section")
+    return region + body[position:]
+
+
+def split_markdown(region):
+    """Split a custom Markdown region into reversible, ordered sections.
+
+    Nothing that was present may be dropped: joining the returned records in
+    order reproduces the input byte for byte, including the leading separator.
+    """
+    markdown_content(region, allow_blank=True)
+    parts = [part for part in re.split(r"(?m)^(?=## )", region) if part != ""]
+    records = []
+    for position, part in enumerate(parts):
+        heading = part.split("\n", 1)[0]
+        if heading.startswith("## "):
+            title = heading[3:].strip()
+            markdown_title(title)
+            require(part == "## " + title or part.startswith("## " + title + "\n"),
+                    "unsupported Markdown section heading")
+        else:
+            require(not part.strip(), "custom Markdown must start with a level-2 heading")
+            title = MARKDOWN_PREAMBLE_TITLE
+        markdown_content(part, allow_blank=title == MARKDOWN_PREAMBLE_TITLE)
+        raw = part.encode("utf-8")
+        records.append({"id": markdown_identifier(title), "ordinal": position,
+                        "title": title, "content": part,
+                        "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)})
+    validate_markdown(records)
+    require(join_markdown(records) == region, "markdown split is not reversible")
+    return records
+
+
+def join_markdown(records):
+    validate_markdown(records)
+    return "".join(record["content"] for record in records)
+
+
+def render_markdown_stub(records):
+    """The compact, human-readable replacement for an externalised region.
+
+    Every section heading stays in the document.  A reader that looks for a
+    known marker (the canonical status file requires "## 前置任务状态（live）"
+    to be present) keeps working, and a human can see which sections exist,
+    how large they are, where their bytes went and how to restore them.
+    """
+    validate_markdown(records)
+    total = sum(record["bytes"] for record in records)
+    digest = hashlib.sha256(join_markdown(records).encode("utf-8")).hexdigest()
+    lines = [MARKDOWN_STUB_HEADING,
+             "- " + str(len(records)) + " 节 / " + str(total) + " 字节已外置为不可变对象；原文未删除、未改写。",
+             "- 全文 sha256 " + digest,
+             "- 逐字节恢复：python scripts/write_current.py markdown --root <project>",
+             "- 引用：.relay/objects/markdown/<aa>/<sha256>.json（内容寻址，摘要写入托管 JSON 块）"]
+    for record in records:
+        if record["title"] == MARKDOWN_PREAMBLE_TITLE:
+            continue
+        lines.append("")
+        lines.append("## " + record["title"])
+        lines.append("- 已外置 · " + record["id"] + " · " + str(record["bytes"])
+                     + " B · sha256 " + record["sha256"][:16] + "…")
+    return "\n".join(lines) + "\n\n"
+
+
+def markdown_text_digest(records):
+    validate_markdown(records)
+    return hashlib.sha256(join_markdown(records).encode("utf-8")).hexdigest()
+
+
+def merge_markdown(records, additions):
+    """Apply typed Markdown upserts by section title.
+
+    A v5 document's custom Markdown is externalised, so a writer adds or
+    replaces a section through a typed change rather than by editing the
+    generated stub.  Existing sections keep their relative order, a new title
+    is appended, and every identity (id, ordinal, content digest, byte length)
+    is recomputed here instead of being transcribed by the caller.
+    """
+    require(isinstance(additions, list), "markdown changes must be a list")
+    working = [{"title": record["title"], "content": record["content"]}
+               for record in records]
+    positions = {record["title"]: index for index, record in enumerate(working)}
+    replaced = 0
+    added = 0
+    for addition in additions:
+        require(isinstance(addition, dict)
+                and set(addition) == {"title", "content"},
+                "invalid markdown change")
+        title, content = addition["title"], addition["content"]
+        markdown_title(title)
+        markdown_content(content, allow_blank=title == MARKDOWN_PREAMBLE_TITLE)
+        if title != MARKDOWN_PREAMBLE_TITLE:
+            require(content == "## " + title or content.startswith("## " + title + "\n"),
+                    "markdown content must start with its own heading")
+        if title in positions:
+            working[positions[title]]["content"] = content
+            replaced += 1
+        else:
+            positions[title] = len(working)
+            working.append({"title": title, "content": content})
+            added += 1
+    merged = []
+    for position, record in enumerate(working):
+        raw = record["content"].encode("utf-8")
+        merged.append({"id": markdown_identifier(record["title"]),
+                       "ordinal": position, "title": record["title"],
+                       "content": record["content"],
+                       "sha256": hashlib.sha256(raw).hexdigest(),
+                       "bytes": len(raw)})
+    validate_markdown(merged)
+    return merged, {"applied": replaced + added, "replaced": replaced, "added": added}
+
+
+def external_markdown_metadata(source_revision, records):
+    """Provenance for the externalisation: where the text came from."""
+    return {"schema": EXTERNAL_MARKDOWN_SCHEMA, "source_revision": int(source_revision),
+            "sections": len(records), "bytes": sum(r["bytes"] for r in records),
+            "text_sha256": markdown_text_digest(records)}
+
+
+def _validate_external_markdown(value):
+    if value is None:
+        return
+    require(isinstance(value, dict) and set(value) == {
+        "schema", "source_revision", "sections", "bytes",
+        "text_sha256"}, "invalid external markdown metadata")
+    require(value["schema"] == EXTERNAL_MARKDOWN_SCHEMA, "invalid external markdown metadata")
+    require(type(value["source_revision"]) is int and value["source_revision"] >= 0,
+            "invalid external markdown revision")
+    require(type(value["sections"]) is int and value["sections"] >= 0
+            and type(value["bytes"]) is int and value["bytes"] >= 0,
+            "invalid external markdown size")
+    require(obs.is_hex64(value["text_sha256"]),
+            "invalid external markdown text digest")
 
 
 def _blocker_scopes(value):
@@ -571,9 +792,12 @@ def acceptance_coverage(state, task, view=None, baseline=None, targets=None,
 
 def validate(state, targets=None):
     require(isinstance(state, dict), "state must be an object")
+    # The key set is exact: every optional collection present in the document
+    # widens the expectation, and a collection that is absent stays absent.
     allowed = {"project", *COLLECTIONS, "extensions", "operations"}
-    if "corrections" in state:
-        allowed = allowed | {"corrections"}
+    for optional in ("corrections", "ac_map", "markdown"):
+        if optional in state:
+            allowed = allowed | {optional}
     require(set(state) == allowed, "invalid state fields")
     project = state["project"]
     require(isinstance(project, dict), "project must be an object")
@@ -599,6 +823,7 @@ def validate(state, targets=None):
         require(type(compaction["retained"]) is int and compaction["retained"] == RECEIPT_KEEP,
                 "invalid compaction retention")
     _validate_ac_map(state["extensions"].get("ac_map"))
+    _validate_external_markdown(state["extensions"].get("external_markdown"))
     scopes = _blocker_scopes(state["extensions"].get("blocker_scope"))
     tasks, blockers, decisions = (keyed(state[k], k) for k in ("tasks", "blockers", "decisions"))
     external = isinstance(state["evidence"], dict)
@@ -615,6 +840,17 @@ def validate(state, targets=None):
         evidence = {}
     else:
         evidence = keyed(state["evidence"], "evidence")
+    # v5 collections are index references inside the document.  The resolved
+    # state keeps the v4 shape (the acceptance map returns to
+    # extensions.ac_map and the Markdown text is reconstructed on demand), so a
+    # v5 document and its v4 predecessor resolve to the same logical state.
+    if "ac_map" in state:
+        require("ac_map" not in state["extensions"], "the acceptance map is declared twice")
+        require(external, "an external acceptance map index requires an external document")
+        _require_index_ref(state["ac_map"], "acceptance map")
+    if "markdown" in state:
+        require(external, "an external markdown index requires an external document")
+        _require_index_ref(state["markdown"], "markdown")
     require(project["current_task"] is None or project["current_task"] in tasks, "current task missing")
     for task in tasks.values():
         require(set(task) <= {"id", "title", "status", "owner", "depends_on", "acceptance", "reason", "generation"}, "invalid task fields")
@@ -696,7 +932,7 @@ def validate(state, targets=None):
 
 def apply(state, patch, baseline, targets=None):
     """Apply typed partial upserts; no deletions, arbitrary paths or evidence rewrites."""
-    require(isinstance(patch, dict) and set(patch) <= {"project", *COLLECTIONS, "extensions", "corrections"}, "invalid change fields")
+    require(isinstance(patch, dict) and set(patch) <= {"project", *COLLECTIONS, "extensions", "corrections", "markdown"}, "invalid change fields")
     out = copy.deepcopy(state)
     if "project" in patch:
         require(isinstance(patch["project"], dict), "project change must be object")

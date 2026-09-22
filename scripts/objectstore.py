@@ -52,6 +52,13 @@ MANIFEST_SCHEMA = "project-continuity/chunk-manifest/v1"
 RECORD_FORMATS = {
     "evidence": "project-continuity/evidence-record/v1",
     "correction": "project-continuity/correction-record/v1",
+    # v5 externalises the project's custom Markdown and its acceptance map
+    # through the same content-addressed machinery: the document keeps an index
+    # reference, never a second copy of the text.
+    "markdown": "project-continuity/markdown-record/v1",
+    # The namespace grammar is lower-case and hyphenated: the JSON key keeps its
+    # underscore (extensions.ac_map), the object namespace does not.
+    "ac-map": "project-continuity/acceptance-map-record/v1",
 }
 RECORD_TYPES = tuple(sorted(RECORD_FORMATS))
 OBJECT_MAX_BYTES = 262144

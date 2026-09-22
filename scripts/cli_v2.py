@@ -29,6 +29,7 @@ from relay_errors import (
     RELAY_CORRECTION_TARGET_UNREACHABLE,
     RELAY_CURRENT_CAPACITY_EXCEEDED,
     RELAY_OBJECT_SCHEMA_INVALID,
+    RELAY_PREVIEW_LEASE_CONFLICT,
     RELAY_SCHEMA_V4_REQUIRES_RESOLVER,
     RELAY_VALIDATION_BUDGET_EXCEEDED,
 )
@@ -122,13 +123,22 @@ def read_envelope(root):
     if meta["schema"] in p.SUPPORTED_SCHEMAS:
         state, matches = parsed_body(body)
         compaction = state["extensions"].get("compaction")
-        p.require((meta["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4)) == (compaction is not None),
+        p.require((meta["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5))
+                  == (compaction is not None),
                   "receipt archive metadata/schema mismatch")
         p.require(state["project"]["status"] == meta["status"], "metadata/project status conflict")
-        if meta["schema"] == p.SCHEMA_V4:
-            p.require(p.is_external(state), "v4 requires an external evidence index")
+        if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS:
+            p.require(p.is_external(state),
+                      "an external document requires an external evidence index")
             p.require("corrections" not in state or isinstance(state["corrections"], dict),
-                      "v4 requires an external corrections index")
+                      "an external document requires an external corrections index")
+        if meta["schema"] == p.SCHEMA_V5:
+            p.require(isinstance(state.get("markdown"), dict)
+                      and isinstance(state.get("ac_map"), dict),
+                      "v5 requires external markdown and acceptance map indexes")
+        else:
+            p.require("markdown" not in state and "ac_map" not in state,
+                      "only a v5 document externalises markdown and the acceptance map")
     else:
         state, matches = None, True
     return document, lines, body, meta, state, matches
@@ -143,6 +153,16 @@ def resolve(document_text, project_root=None):
     return relay_v4.resolve(document_text, project_root)
 
 
+def resolve_markdown(document_text, project_root=None):
+    """Public resolver contract: the exact custom Markdown of a document.
+
+    For a v5 document the text is reconstructed byte for byte from the bound
+    objects, so a reader that looks for a marker keeps seeing the real content
+    instead of the generated stub.
+    """
+    return relay_v4.resolve_markdown(document_text, project_root)
+
+
 def envelope_state(document_text):
     """Read-only front matter plus managed JSON (never a completed state)."""
     return relay_v4.envelope_state(document_text)
@@ -151,7 +171,7 @@ def envelope_state(document_text):
 def read(root):
     """Full documented read: v4 evidence is reconstructed from its objects."""
     document, lines, body, meta, state, matches = read_envelope(root)
-    if state is not None and meta["schema"] == p.SCHEMA_V4:
+    if state is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS:
         state = relay_v4.expand(state, root, meta["project_id"])
     return document, lines, body, meta, state, matches
 
@@ -344,8 +364,8 @@ def _archive_chain(root, state, meta):
     compaction = state["extensions"].get("compaction")
     if compaction is None:
         return []
-    p.require(meta["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4),
-              "receipt archive requires project-continuity/v3 or v4")
+    p.require(meta["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5),
+              "receipt archive requires project-continuity/v3, v4 or v5")
     p.validate(state)
     head = compaction["head"]
     if head is None:
@@ -454,18 +474,29 @@ def _candidate_bytes(document):
     return len(document.encode("utf-8"))
 
 
-def _plan_candidate(lines, body, state, updates, project_id, *, force=False, automatic=True):
-    """Pure budget/render plan; caller supplies complete transaction metadata."""
-    candidate = metadata(lines, updates) + p.render_body(state, body)
+def _plan_candidate(lines, body, state, updates, project_id, *, force=False, automatic=True,
+                    markdown=None):
+    """Pure budget/render plan; caller supplies complete transaction metadata.
+
+    When the external Markdown records are supplied the candidate's unmanaged
+    region is regenerated from them, so a v5 document can never drift from the
+    objects its index reference names.
+    """
+    def render(value, compact=False):
+        region = body if markdown is None else p.render_region(
+            body, p.render_markdown_stub(markdown))
+        return metadata(lines, updates) + p.render_body(value, region, compact=compact)
+
+    candidate = render(state)
     ungoverned_bytes = _candidate_bytes(candidate)
     segments, compacted = [], False
     _limit, trigger, target = p.budget(updates["schema"])
-    if updates["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4) and (force or
+    if updates["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5) and (force or
             (automatic and ungoverned_bytes >= trigger)):
         state, segments, compacted = _plan_compaction(state, project_id, force=True)
-        candidate = metadata(lines, updates) + p.render_body(state, body)
+        candidate = render(state)
         if len(candidate.encode("utf-8")) > target:
-            candidate = metadata(lines, updates) + p.render_body(state, body, compact=True)
+            candidate = render(state, compact=True)
     final_bytes = _candidate_bytes(candidate)
     return state, candidate, segments, compacted, ungoverned_bytes, final_bytes
 
@@ -506,11 +537,14 @@ def _reachable_archive_names(root, state, meta):
 
 
 def _reachable_object_names(root, meta, stub):
-    """Object files the committed state depends on (v4 only)."""
-    if meta["schema"] != p.SCHEMA_V4 or stub is None:
+    """Object files the committed state depends on (external schemas only)."""
+    if meta["schema"] not in relay_v4.EXTERNAL_SCHEMAS or stub is None:
         return []
     names, budget = [], obs.Budget()
-    for field, record_type in (("evidence", "evidence"), ("corrections", "correction")):
+    fields = [("evidence", "evidence"), ("corrections", "correction")]
+    if meta["schema"] == p.SCHEMA_V5:
+        fields.extend([("markdown", "markdown"), ("ac_map", "ac-map")])
+    for field, record_type in fields:
         ref = stub.get(field)
         if isinstance(ref, dict) and ref.get("index") is not None:
             names.extend(obs.index_paths(root, meta["project_id"], record_type,
@@ -683,20 +717,31 @@ def _receipt_bytes(operation_id, revision):
 
 
 def _plan_candidate_from_state(lines, body, state, updates, project_id, *, force=False,
-                               automatic=True):
+                               automatic=True, markdown=None):
     """Plan one commit from a state that is already in memory."""
     _state, candidate, segments, would_compact, _ungoverned, projected = _plan_candidate(
         lines, body, copy.deepcopy(state), updates, project_id, force=force,
-        automatic=automatic)
+        automatic=automatic, markdown=markdown)
     return candidate, projected, segments, would_compact
 
 
 def _commit_model(meta, lines, body, state, command, revision, operation_id, writer,
-                  lease_minutes, stamp):
-    """Model one commit exactly as the write path performs it."""
+                  lease_minutes, stamp, *, patch=None, git=None, targets=None,
+                  markdown=None):
+    """Model one commit exactly as the write path performs it.
+
+    An optional typed patch is applied first, using the same ``progress.apply``
+    upsert as the commit, so a preview shares the commit's candidate builder
+    instead of re-serialising the state.  ``git`` is the observed baseline that
+    the commit would record; without it an evidence record would be modelled
+    with a different (synthetic) baseline than the commit writes.
+    """
     state = copy.deepcopy(state)
-    state["operations"] = list(state["operations"]) + [
-        {"id": operation_id, "hash": "0" * 64, "revision": revision}]
+    if patch:
+        state = p.apply(state, patch, git if git is not None else {"kind": "none"},
+                        targets=targets)
+    receipt = {"id": operation_id, "hash": "0" * 64, "revision": revision}
+    state["operations"] = list(state["operations"]) + [receipt]
     status = state["project"]["status"]
     if command == "resume" and status == "paused":
         status = "active"
@@ -714,16 +759,21 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
                    "updated_at": iso(stamp), "writer": writer,
                    "lease_until": iso(stamp + timedelta(minutes=lease_minutes)),
                    "status": status}
+    if git is not None:
+        # A real commit also rewrites the recorded Git fields.  When the preview
+        # captured the same environment it must include them, or the predicted
+        # byte count would silently exclude the front-matter change.
+        updates.update(git_fields(git))
     _candidate, projected, segments, would_compact = _plan_candidate_from_state(
-        lines, body, state, updates, meta["project_id"])
-    receipt = {"id": operation_id, "hash": "0" * 64, "revision": revision}
+        lines, body, state, updates, meta["project_id"], markdown=markdown)
     receipt_bytes = len(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     return {"command": command, "revision": revision, "operation_id": operation_id,
             "candidate_bytes": projected, "archived_segments": len(segments),
             "would_compact": bool(would_compact), "receipt_bytes": receipt_bytes,
             "writer_bytes": len(writer.encode("utf-8")),
             "operation_id_bytes": len(operation_id.encode("utf-8")),
-            "revision_digits": len(str(revision)), "state": state}
+            "revision_digits": len(str(revision)), "state": state,
+            "patched": bool(patch)}
 
 
 def _modelled_next_commit(lines, body, stub, meta):
@@ -881,7 +931,7 @@ def _growth_report(root, meta, lines, body, stub):
     report["operation_receipt"] = measured(
         lambda value: value["operations"].append(
             {"id": "growth-operation", "hash": "0" * 64, "revision": revision}))
-    if schema == p.SCHEMA_V4:
+    if schema in relay_v4.EXTERNAL_SCHEMAS:
         # Both classes are measured explicitly: a correction is the class a
         # reviewer is most likely to add, and an evidence record is the class a
         # normal round adds.  Neither is inferred from the other.
@@ -957,6 +1007,231 @@ def _growth_report(root, meta, lines, body, stub):
     return report
 
 
+LONG_RECORD_HINT_BYTES = 4096
+LONG_RECORD_FIELDS = {"tasks": ("title", "acceptance"),
+                      "blockers": ("description", "resolution"),
+                      "evidence": ("check", "ref"),
+                      "decisions": ("conclusion", "reason")}
+
+
+def _step_summary(model, limit):
+    """One planned commit reduced to the capacity-relevant numbers."""
+    return {"command": model["command"], "revision": model["revision"],
+            "operation_id": model["operation_id"],
+            "candidate_bytes": model["candidate_bytes"],
+            "would_fit": model["candidate_bytes"] <= limit,
+            "headroom_bytes": limit - model["candidate_bytes"],
+            "would_compact": bool(model["would_compact"]),
+            "archived_segments": model["archived_segments"]}
+
+
+def _next_save_cycle(lines, body, state, meta, schema, revision, *, writer="next-writer",
+                     lease_minutes=30, stamp=None):
+    """Second-order estimate: the next ordinary resume -> save cycle.
+
+    Modelled with the same planner as a commit, from the state that was just
+    written.  It is an estimate, never a reservation: the real commit rereads
+    under the lock and is not bound by this prediction.
+    """
+    stamp = stamp or now()
+    limit = p.budget(schema)[0]
+    resume_op, save_op = writer + "-resume", writer + "-save"
+    first = _commit_model(meta, lines, body, state, "resume", revision + 1, resume_op,
+                          writer, lease_minutes, stamp)
+    second = _commit_model(meta, lines, body, first["state"], "save", revision + 2,
+                           save_op, writer, lease_minutes, stamp)
+    steps = [_step_summary(first, limit), _step_summary(second, limit)]
+    return {"status": "modelled", "commands": ["resume", "save"], "revision": revision,
+            "steps": steps, "would_fit": all(step["would_fit"] for step in steps),
+            "end_bytes": second["candidate_bytes"],
+            "end_headroom_bytes": limit - second["candidate_bytes"],
+            "would_compact": first["would_compact"] or second["would_compact"],
+            "model": {"writer": writer, "operation_ids": [resume_op, save_op],
+                      "lease_minutes": lease_minutes, "clock": iso(stamp),
+                      "patch": "none (a metadata-only maintenance cycle)"},
+            "assumptions": ["the project's business content is unchanged",
+                            "the cycle is one resume followed by one save"],
+            "invalidated_by": ["a different writer or operation id length",
+                               "business content added or evidence recorded before the cycle",
+                               "another concurrent commit changing the revision",
+                               "receipt compaction triggered by a different history"]}
+
+
+def _capacity_receipt(schema, before_bytes, after_bytes, *, committed, replayed=False,
+                      object_store_new_bytes=0, archived_segments=0,
+                      next_save_cycle=None, next_cycle_reason=None):
+    """Uniform, backward-compatible capacity block for a write result.
+
+    `delta_bytes` is the CURRENT.md net change only; object-store bytes are
+    reported separately so the two are never added together.  A replay reports
+    the current observed occupancy, never a fresh commit, and a model that could
+    not be computed is named rather than reported as a reassuring zero.
+    """
+    limit, trigger, target = p.budget(schema)
+    used = after_bytes
+    near = used >= trigger
+    if replayed:
+        action = "replay: no new bytes were committed"
+    elif not committed:
+        action = "no commit was attempted"
+    elif used > limit:
+        action = "over the limit: migration or business review required"
+    elif near:
+        action = ("above the compaction trigger: compact receipts or migrate to an "
+                  "external schema before the next write")
+    else:
+        action = "none"
+    if next_save_cycle is None:
+        next_save_cycle = {"status": "not_computed",
+                           "reason": next_cycle_reason or "not modelled"}
+    return {"committed": committed, "replayed": replayed, "used_bytes": used,
+            "limit_bytes": limit, "headroom_bytes": limit - used, "delta_bytes": after_bytes - before_bytes,
+            "trigger_bytes": trigger, "target_bytes": target, "near_limit": near,
+            "recommended_action": action, "object_store_new_bytes": object_store_new_bytes,
+            "archived_segments": archived_segments,
+            "next_save_cycle_estimate": next_save_cycle}
+
+
+def _record_field_bytes(record, field):
+    value = record.get(field)
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _reference_kind(value):
+    """A protocol object reference is provable; a plain path is only a pointer."""
+    if not isinstance(value, str):
+        return "not_a_reference"
+    if re.match(r"^objects/", value) or ".relay/objects/" in value:
+        return "protocol_object_reference"
+    if re.fullmatch(r"[0-9a-f]{64}", value):
+        return "content_digest"
+    return "plain_path_reference"
+
+
+def _long_record_hints(state, threshold):
+    """Non-blocking, byte-based hints; never truncates or rewrites content.
+
+    `result` on an evidence record is an enum and is intentionally not treated
+    as prose.  The report locates the collection, record id and field and never
+    echoes the value, so a large note is not duplicated into the report.
+    """
+    hints, external = [], []
+    for collection, fields in LONG_RECORD_FIELDS.items():
+        rows = state.get(collection)
+        if isinstance(rows, dict):
+            external.append({"collection": collection,
+                             "reason": "collection is externalised; it does not grow CURRENT.md"})
+            continue
+        for record in rows or []:
+            if not isinstance(record, dict):
+                continue
+            base = {"collection": collection, "id": record.get("id")}
+            for field in fields:
+                size = _record_field_bytes(record, field)
+                if size >= threshold:
+                    hints.append({**base, "field": field, "bytes": size,
+                                  "recommended": "keep a pointer here and put the detail in an evidence root"})
+            total = len(json.dumps(record, ensure_ascii=False).encode("utf-8"))
+            if total >= threshold:
+                hints.append({**base, "field": "(record)", "bytes": total,
+                              "recommended": "split the record or reference an evidence root"})
+    references = [{"id": record.get("id"), "kind": _reference_kind(record.get("ref"))}
+                  for record in (state.get("evidence") or [])
+                  if isinstance(record, dict)]
+    return {"threshold_bytes": threshold, "count": len(hints), "hints": hints,
+            "external_collections": external, "references": references}
+
+
+def _patch_preview(root, args, lines, body, meta, stub, patch):
+    """Read-only preview of a typed patch, reusing the commit's planner.
+
+    Never creates a lock, lease, object, receipt or history file and never
+    changes CURRENT.md.  The real commit rereads and revalidates under the lock.
+    """
+    schema = meta["schema"]
+    limit, _trigger, _target = p.budget(schema)
+    writer = getattr(args, "writer", None) or "preview-writer"
+    lease_minutes = getattr(args, "lease_minutes", None) or 30
+    operation_id = getattr(args, "operation_id", None)
+    if schema in relay_v4.EXTERNAL_SCHEMAS:
+        full = relay_v4.expand(stub, root, meta["project_id"])
+    else:
+        full = copy.deepcopy(stub)
+    resolver = relay_v4.make_target_resolver(root, meta["project_id"], stub)
+    git = git_state.capture(root)
+    if git.get("kind") == "error":
+        return {"status": "unavailable", "reason": "Git inspection failed; preview refused"}
+    md_patch = patch.get("markdown") if isinstance(patch, dict) else None
+    markdown_records = None
+    if md_patch is not None:
+        p.require(schema == p.SCHEMA_V5, "markdown changes require a v5 document")
+        markdown_records = relay_v4.collect_markdown(stub, root, meta["project_id"])
+        markdown_records, _change = p.merge_markdown(markdown_records, md_patch)
+    apply_patch = ({key: value for key, value in patch.items() if key != "markdown"}
+                   if md_patch is not None else patch)
+    stamp = now()
+    revision = int(meta["revision"])
+    active = lease_active(meta)
+    if active and meta["writer"] != writer:
+        raise RelayError(RELAY_PREVIEW_LEASE_CONFLICT,
+                         "another writer holds a live lease; no commit can be predicted")
+    if active:
+        model = _commit_model(meta, lines, body, full, "save", revision + 1,
+                              operation_id or "preview-save", writer, lease_minutes, stamp,
+                              patch=apply_patch, git=git, targets=resolver,
+                              markdown=markdown_records if schema == p.SCHEMA_V5 else None)
+        steps, mode, commands = [model], "save", ["save"]
+    else:
+        resume_op = (operation_id + "-resume") if operation_id else "preview-resume"
+        save_op = (operation_id + "-save") if operation_id else "preview-save"
+        first = _commit_model(meta, lines, body, full, "resume", revision + 1, resume_op,
+                              writer, lease_minutes, stamp, git=git, targets=resolver)
+        second = _commit_model(meta, lines, body, first["state"], "save", revision + 2,
+                               save_op, writer, lease_minutes, stamp, patch=apply_patch,
+                               git=git, targets=resolver,
+                               markdown=markdown_records if schema == p.SCHEMA_V5 else None)
+        steps, mode, commands = [first, second], "cycle", ["resume", "save"]
+    summaries = [_step_summary(step, limit) for step in steps]
+    final_bytes = summaries[-1]["candidate_bytes"]
+    result = {"status": "modelled", "mode": mode, "commands": commands, "schema": schema,
+              "revision": revision, "steps": summaries, "final_candidate_bytes": final_bytes,
+              "final_headroom_bytes": limit - final_bytes,
+              "would_fit": all(step["would_fit"] for step in summaries),
+              "would_compact": any(step["would_compact"] for step in summaries),
+              "model": {"writer": writer, "operation_ids": [step["operation_id"] for step in summaries],
+                        "lease_minutes": lease_minutes, "clock": iso(stamp),
+                        "patch_fields": sorted(patch) if isinstance(patch, dict) else []},
+              "assumptions": ["the typed patch is applied on the save commit",
+                              "the preview models the same receipt, lease and derived view as a commit"],
+              "invalidated_by": ["a concurrent commit changing the revision",
+                                 "a different lease state at commit time",
+                                 "business content added outside the patch"],
+              "read_only": True, "created_files": False, "recheck_on_apply": True}
+    if isinstance(patch, dict) and "project" in patch:
+        next_step = patch["project"].get("next_step")
+        if isinstance(next_step, str):
+            result["next_step_bytes"] = len(next_step.encode("utf-8"))
+    if result["would_fit"]:
+        try:
+            nxt = _next_save_cycle(lines, body, steps[-1]["state"], meta, schema,
+                                   steps[-1]["revision"], writer=writer,
+                                   lease_minutes=lease_minutes, stamp=stamp)
+            result["next_save_cycle_estimate"] = nxt
+            if not nxt["would_fit"] or nxt["end_headroom_bytes"] < 0:
+                result["recommended_action"] = (
+                    "this save fits, but the next ordinary resume->save cycle does not; "
+                    "compact receipts or migrate to an external schema first")
+        except (RelayError, p.Invalid, fs.Error, OSError, ValueError, KeyError) as exc:
+            result["next_save_cycle_estimate"] = {
+                "status": "not_computed",
+                "reason": exc.code if isinstance(exc, RelayError) else "model unavailable"}
+    return result
+
+
 def capacity_view(args, root):
     """Read-only capacity: current file, object store and the next commit."""
     path = fs.child(root, ".relay", "CURRENT.md")
@@ -979,9 +1254,18 @@ def capacity_view(args, root):
                           "disk_free_bytes": obs.disk_free(root),
                           "reserve_bytes": obs.DISK_RESERVE_BYTES},
               "garbage_collection": "never automatic"}
-    if all(value is not None for value in (getattr(args, "writer", None),
-                                           getattr(args, "expected_revision", None),
-                                           getattr(args, "operation_id", None))):
+    threshold = getattr(args, "long_record_threshold", None)
+    if threshold is None:
+        threshold = LONG_RECORD_HINT_BYTES
+    if stub is not None:
+        result["long_records"] = _long_record_hints(stub, threshold)
+    patch = input_patch(args) if getattr(args, "input", None) else None
+    if patch is not None:
+        p.require(stub is not None, "v1 is read-only; migrate before previewing a patch")
+        result["patch_preview"] = _patch_preview(root, args, lines, body, meta, stub, patch)
+    if patch is None and all(value is not None for value in (getattr(args, "writer", None),
+                                                             getattr(args, "expected_revision", None),
+                                                             getattr(args, "operation_id", None))):
         # Model the realistic next write (a resume) so that the predicted byte
         # count is the one the commit will actually produce.  The dry run runs the
         # same planning code as the commit, so with identical arguments the two
@@ -1069,10 +1353,9 @@ def integrity_check(root, meta, stub, enabled, state=None):
     """A full object read is only performed when it is explicitly requested."""
     if not enabled:
         return {"checked": False, "state": "not_checked", "reason": "integrity_not_checked",
-                "applicable": meta["schema"] == p.SCHEMA_V4, "objects_checked": 0}
-    result = object_integrity(root, meta["project_id"], stub, meta["schema"])
-    result["applicable"] = meta["schema"] == p.SCHEMA_V4
-    return result
+                "applicable": meta["schema"] in relay_v4.EXTERNAL_SCHEMAS,
+                "objects_checked": 0, "verified": False}
+    return relay_v4.object_integrity(root, meta["project_id"], stub, meta["schema"])
 
 
 MANDATORY_CHECKS = ("coverage", "baseline", "mapping")
@@ -1095,8 +1378,12 @@ def verification_record(checks, required=(), complete=True, reason=None):
                                     "reason": "integrity_not_checked"})
     checks.setdefault("external", {"checked": False, "state": "not_checked",
                                    "reason": "external_checks_not_executed"})
+    # A check that does not apply to this schema blocks nothing: it is reported
+    # as not applicable instead of being folded into a pass or a failure.
     failures = [(name, check) for name, check in checks.items()
-                if name in required and _check_state(check) != "verified"]
+                if name in required and (check.get("applicable", True)
+                                         if isinstance(check, dict) else True)
+                and _check_state(check) != "verified"]
     not_checked = sorted(name for name, check in checks.items()
                          if _check_state(check) == "not_checked")
     if not complete:
@@ -1141,6 +1428,50 @@ def _conclusion(verified, reason, not_checked):
     return "not verified: " + str(reason)
 
 
+def markdown_view(args, root):
+    """Read-only: the exact custom Markdown text of a document (v4 or v5).
+
+    For a v5 document the text is reconstructed byte for byte from the bound,
+    content-addressed objects, so externalising it never loses a byte and never
+    silently drops a section.  Checksums are reported so the restored text can
+    be verified without trusting this output.
+    """
+    document, _lines, _body, meta, stub, matches = read_envelope(root)
+    p.require(stub is not None, "v1 is read-only; migrate before reading markdown")
+    p.require(matches, "derived view conflict; review direct edits before reading markdown")
+    selector = getattr(args, "section", None)
+    if meta["schema"] != p.SCHEMA_V5:
+        p.require(selector is None, "sections are addressable only on a v5 document")
+        text = relay_v4.resolve_markdown(document, root)
+        return {"schema": meta["schema"], "revision": int(meta["revision"]),
+                "external": False, "count": 0, "sections": [],
+                "bytes": len(text.encode("utf-8")),
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "text": text}
+    records = relay_v4.collect_markdown(stub, root, meta["project_id"])
+    sections = [{"id": record["id"], "ordinal": record["ordinal"], "title": record["title"],
+                 "bytes": record["bytes"], "sha256": record["sha256"]} for record in records]
+    if selector is not None:
+        p.identifier(selector)
+        chosen = [record for record in records if record["id"] == selector]
+        p.require(len(chosen) == 1, "unknown markdown section")
+        record = chosen[0]
+        return {"schema": meta["schema"], "revision": int(meta["revision"]),
+                "external": True, "section": record["id"], "title": record["title"],
+                "bytes": record["bytes"], "sha256": record["sha256"], "text": record["content"]}
+    text = p.join_markdown(records)
+    return {"schema": meta["schema"], "revision": int(meta["revision"]),
+            "external": True, "sections": sections, "count": len(sections),
+            "bytes": len(text.encode("utf-8")),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "provenance": (stub.get("extensions", {}) or {}).get("external_markdown"),
+            "provenance_meaning": {
+                "source_revision": "the revision the text was FIRST externalised from; it is not the revision of the last content change",
+                "content_identity": ["bytes", "sha256", "sections"],
+                "freshness_rule": "compare sha256/bytes with the bound sections; source_revision alone never proves the text is stale"},
+            "text": text}
+
+
 def coverage_view(args, root):
     """Read-only evidence x acceptance-condition matrix.
 
@@ -1154,7 +1485,8 @@ def coverage_view(args, root):
     p.require(matches, "derived view conflict; review direct edits before reading coverage")
     observed = capture_baseline(root)
     block = baseline_block(meta, observed)
-    state = relay_v4.expand(stub, root, meta["project_id"]) if meta["schema"] == p.SCHEMA_V4 else stub
+    state = (relay_v4.expand(stub, root, meta["project_id"])
+             if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS else stub)
     content_sha = hashlib.sha256(document.encode("utf-8")).hexdigest()
     result = relay_v4.coverage(state, meta["project_id"], getattr(args, "task", None),
                                getattr(args, "limit", None) or 20,
@@ -1205,7 +1537,8 @@ def handoff_view(args, root):
                                   meta["revision"], expected=None)
     except RelayError as exc:
         raise page_error from exc
-    state = relay_v4.expand(stub, root, meta["project_id"]) if meta["schema"] == p.SCHEMA_V4 else stub
+    state = (relay_v4.expand(stub, root, meta["project_id"])
+             if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS else stub)
     current = hashlib.sha256(document.encode("utf-8")).hexdigest()
     args.task = getattr(args, "task", None)
     try:
@@ -1280,7 +1613,8 @@ def _objects_info(root, meta, stub):
     stats = obs.store_stats(root)
     evidence = stub.get("evidence") if isinstance(stub, dict) else None
     corrections = stub.get("corrections") if isinstance(stub, dict) else None
-    return {"integrity": "ok" if meta["schema"] == p.SCHEMA_V4 else "not_configured",
+    return {"integrity": ("ok" if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS
+                          else "not_configured"),
             "files": stats["files"], "bytes": stats["bytes"],
             "index": evidence.get("index") if isinstance(evidence, dict) else None,
             "corrections_index": corrections.get("index") if isinstance(corrections, dict) else None,
@@ -1291,12 +1625,18 @@ def _objects_info(root, meta, stub):
             "reserve_bytes": obs.DISK_RESERVE_BYTES}
 
 
-def _resolve_for_read(root, meta, stub):
-    """Resolve v4 objects; return (state, named_error)."""
-    if stub is None or meta["schema"] != p.SCHEMA_V4:
+def _resolve_for_read(root, meta, stub, budget=None):
+    """Resolve external objects; return (state, named_error).
+
+    Resolving is itself a full read of every reachable object, so the caller
+    receives the budget actually consumed and can report how many objects were
+    checked instead of claiming an unknown.
+    """
+    if stub is None or meta["schema"] not in relay_v4.EXTERNAL_SCHEMAS:
         return stub, None
+    budget = budget if budget is not None else obs.Budget()
     try:
-        return relay_v4.expand(stub, root, meta["project_id"]), None
+        return relay_v4.expand(stub, root, meta["project_id"], budget), None
     except RelayError as exc:
         return stub, exc
     except (p.Invalid, fs.Error, OSError, UnicodeError, ValueError) as exc:
@@ -1318,7 +1658,10 @@ def status(args, root):
     limit, trigger, target = p.budget(meta["schema"])
     archive = _archive_info(root, stub, meta)
     objects = _objects_info(root, meta, stub)
-    state, object_error = _resolve_for_read(root, meta, stub)
+    read_budget = obs.Budget()
+    state, object_error = _resolve_for_read(root, meta, stub, read_budget)
+    objects["objects_checked"] = (read_budget.files
+                                  if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS else 0)
     resolved = state is not None and object_error is None
     if object_error is not None:
         objects["integrity"] = ("budget_exceeded"
@@ -1330,14 +1673,15 @@ def status(args, root):
                      "applicable": True, "scope": block["check"]["scope"],
                      "does_not_cover": block["check"]["does_not_cover"]},
         "integrity": ({"checked": objects["integrity"] not in ("degraded", "budget_exceeded"),
-                       "state": ("verified" if objects["integrity"] == "ok" else
+                       "state": ("not_applicable" if meta["schema"] not in relay_v4.EXTERNAL_SCHEMAS
+                                 else "verified" if objects["integrity"] == "ok" else
                                  "budget_exceeded" if objects["integrity"] == "budget_exceeded" else
-                                 "not_configured" if objects["integrity"] == "not_configured" else
                                  "degraded"),
                        "reason": None if objects["integrity"] in ("ok", "not_configured")
                                  else (object_error.code if object_error is not None
                                        else "RELAY_OBJECT_INTEGRITY_DEGRADED"),
-                       "applicable": meta["schema"] == p.SCHEMA_V4, "objects_checked": None,
+                       "applicable": meta["schema"] in relay_v4.EXTERNAL_SCHEMAS,
+                       "objects_checked": objects["objects_checked"],
                        "verified": (objects["integrity"] in ("ok", "not_configured")
                                      and archive["integrity"] != "invalid")}),
         "external": external_check(args),
@@ -1393,7 +1737,8 @@ def status(args, root):
     if resolved:
         result.update(p.summary(state, git))
         preview_state, planned, would_compact = _plan_compaction(stub, meta["project_id"])
-        schema = p.SCHEMA_V4 if meta["schema"] == p.SCHEMA_V4 else p.SCHEMA_V3
+        schema = (meta["schema"] if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS
+                  else p.SCHEMA_V3)
         if would_compact:
             preview = metadata(lines, {"schema": schema}) + p.render_body(preview_state, body)
             projected = len(preview.encode("utf-8"))
@@ -1467,6 +1812,14 @@ def mutate(args, root, dry_run=False):
     patch = (input_patch(args)
              if args.command in ("update", "save")
              and getattr(args, "input", None) else {})
+    # The custom Markdown of a v5 document is a managed, externalised collection:
+    # it is applied here (the state has to be resolved first) and never reaches
+    # the generic upsert, which only knows the v2/v3/v4 collections.
+    markdown_patch = patch.get("markdown") if isinstance(patch, dict) else None
+    if markdown_patch is not None:
+        apply_patch = {key: value for key, value in patch.items() if key != "markdown"}
+    else:
+        apply_patch = patch
     p.require(args.expected_revision is not None and args.expected_revision >= 0, "expected revision required")
     p.identifier(args.writer)
     p.identifier(args.operation_id)
@@ -1484,14 +1837,34 @@ def mutate(args, root, dry_run=False):
         hash_input["to_v3"] = True
     if getattr(args, "to_v4", False):
         hash_input["to_v4"] = True
+    if getattr(args, "to_v5", False):
+        hash_input["to_v5"] = True
     operation_hash = p.digest(hash_input)
     # Never create relay or lock if CURRENT is absent.
     fs.child(root, ".relay", "CURRENT.md", exists=True)
     with (nullcontext() if dry_run else fs.locked(fs.child(root, ".relay", "CURRENT.md.lock"))):
         old, lines, body, meta, state, matches = read_envelope(root)
         full = state
-        if state is not None and meta["schema"] == p.SCHEMA_V4:
+        # The custom Markdown records travel with the transaction: for a v5
+        # document they are read from the store, and a v4 to v5 migration
+        # derives them from the document's own region before anything is
+        # published.
+        markdown_records = None
+        stub_regenerated = False
+        markdown_change = None
+        if state is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS:
             full = relay_v4.expand(state, root, meta["project_id"])
+            if meta["schema"] == p.SCHEMA_V5:
+                markdown_records = relay_v4.collect_markdown(state, root, meta["project_id"])
+                if markdown_patch is not None:
+                    markdown_records, markdown_change = p.merge_markdown(
+                        markdown_records, markdown_patch)
+                # The stub is generated from the bound records.  A hand edit is
+                # regenerated rather than honoured (the edited bytes remain in
+                # the history snapshot of the revision being replaced) and the
+                # write reports that it happened instead of hiding it.
+                stub_regenerated = (p.custom_region(body)
+                                    != p.render_markdown_stub(markdown_records))
         # A correction target whose bytes live on disk is only ever bound after
         # this root-bound resolver has verified it.  Without one, such a target
         # is refused by name rather than accepted on its syntax.
@@ -1503,7 +1876,13 @@ def mutate(args, root, dry_run=False):
             for operation in state["operations"]:
                 if operation["id"] == args.operation_id:
                     p.require(operation["hash"] == operation_hash, "operation ID reused with different input")
-                    return {"revision": operation["revision"], "current_revision": int(meta["revision"]), "replayed": True}
+                    replayed_bytes = len(old.encode("utf-8"))
+                    return {"revision": operation["revision"], "current_revision": int(meta["revision"]),
+                            "replayed": True,
+                            "capacity": _capacity_receipt(
+                                meta["schema"], replayed_bytes, replayed_bytes,
+                                committed=False, replayed=True,
+                                next_cycle_reason="a replay commits no new state")}
         if state is not None and state["extensions"].get("compaction") is not None:
             # A damaged archive may still be displayed, but no mutation can
             # proceed because idempotent retry cannot be proven safely.
@@ -1515,8 +1894,13 @@ def mutate(args, root, dry_run=False):
             for operation in archived:
                 if operation["id"] == args.operation_id:
                     p.require(operation["hash"] == operation_hash, "operation ID reused with different input")
+                    replayed_bytes = len(old.encode("utf-8"))
                     return {"revision": operation["revision"], "current_revision": int(meta["revision"]),
-                            "replayed": True, "archived": True}
+                            "replayed": True, "archived": True,
+                            "capacity": _capacity_receipt(
+                                meta["schema"], replayed_bytes, replayed_bytes,
+                                committed=False, replayed=True,
+                                next_cycle_reason="a replay commits no new state")}
         p.require(int(meta["revision"]) == args.expected_revision, "revision conflict")
         p.require(matches or args.command == "recover", "derived view conflict; review direct edits before writing")
         git = git_state.capture(root)
@@ -1528,11 +1912,20 @@ def mutate(args, root, dry_run=False):
                       "Git drift detected; review before --allow-drift")
         migrate_to_v3 = args.command == "migrate" and getattr(args, "to_v3", False)
         migrate_to_v4 = args.command == "migrate" and getattr(args, "to_v4", False)
-        p.require(not (migrate_to_v3 and migrate_to_v4), "choose one migration target")
+        migrate_to_v5 = args.command == "migrate" and getattr(args, "to_v5", False)
+        p.require(sum((bool(migrate_to_v3), bool(migrate_to_v4), bool(migrate_to_v5))) <= 1,
+                  "choose one migration target")
+        p.require(markdown_patch is None or meta["schema"] == p.SCHEMA_V5,
+                  "markdown changes require a v5 document")
         if args.command == "migrate":
             p.require(not lease_active(meta), "active lease prevents migration")
             p.require(args.source_sha256 == hashlib.sha256(old.encode()).hexdigest(), "migration source hash changed or missing")
-            if migrate_to_v4:
+            if migrate_to_v5:
+                p.require(meta["schema"] == p.SCHEMA_V4,
+                          "v5 migration requires a v4 document; the v4 migration is already done")
+                full = relay_v4.expand(state, root, meta["project_id"])
+                markdown_records = p.split_markdown(p.custom_region(body))
+            elif migrate_to_v4:
                 p.require(meta["schema"] in (p.SCHEMA_V2, p.SCHEMA_V3),
                           "v4 migration requires a v2 or v3 document")
                 full = p.validate(copy.deepcopy(state))
@@ -1549,7 +1942,7 @@ def mutate(args, root, dry_run=False):
         elif args.command in ("update", "save", "compact"):
             p.require(meta["writer"] == args.writer and lease_active(meta), "missing, expired or conflicting lease; resume first")
             if args.command in ("update", "save"):
-                full = p.apply(full, patch, git, targets=target_resolver)
+                full = p.apply(full, apply_patch, git, targets=target_resolver)
             if args.command == "save" and "status" not in patch.get("project", {}) and full["project"]["status"] == "active":
                 full["project"]["status"] = "paused"
         elif args.command == "recover":
@@ -1564,8 +1957,9 @@ def mutate(args, root, dry_run=False):
                 snap_lines, snap_body, snap_meta = split(snap)
                 p.require(snap_meta["project_id"] == meta["project_id"] and
                           snap_meta["schema"] in p.SUPPORTED_SCHEMAS, "snapshot project or schema mismatch")
-                if meta["schema"] == p.SCHEMA_V4:
-                    p.require(snap_meta["schema"] == p.SCHEMA_V4, "v4 recovery requires a v4 snapshot")
+                if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS:
+                    p.require(snap_meta["schema"] == meta["schema"],
+                              "recovery requires a snapshot of the same external schema")
                     snap_state, snap_matches = parsed_body(snap_body)
                     full = relay_v4.expand(snap_state, root, snap_meta["project_id"])
                 else:
@@ -1581,7 +1975,9 @@ def mutate(args, root, dry_run=False):
         auto_enabled = not getattr(args, "no_auto_compact", False)
         compacted = False
         segments = []
-        if migrate_to_v4 or meta["schema"] == p.SCHEMA_V4:
+        if migrate_to_v5 or meta["schema"] == p.SCHEMA_V5:
+            schema = p.SCHEMA_V5
+        elif migrate_to_v4 or meta["schema"] == p.SCHEMA_V4:
             schema = p.SCHEMA_V4
         elif meta["schema"] == p.SCHEMA_V3 or migrate_to_v3:
             schema = p.SCHEMA_V3
@@ -1589,10 +1985,23 @@ def mutate(args, root, dry_run=False):
             schema = p.SCHEMA
         limit, trigger, target = p.budget(schema)
         if args.command == "compact":
-            p.require(schema in (p.SCHEMA_V3, p.SCHEMA_V4),
+            p.require(schema in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5),
                       "v2 requires explicit migrate --to-v3 before compact")
         keep_lease = args.command in ("resume", "update", "compact")
         timestamp = now()
+        if migrate_to_v5:
+            # Additive provenance: the v3 to v4 record in extensions.migration is
+            # never rewritten, and the new step is recorded separately.
+            full["extensions"]["migration_v5"] = {
+                "source_schema": meta["schema"],
+                "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
+                "to_schema": p.SCHEMA_V5,
+                "migrated_at": iso(timestamp),
+                "record_mapping": {"markdown_sections": len(markdown_records or []),
+                                   "markdown_bytes": sum(r["bytes"] for r in markdown_records or []),
+                                   "tasks": len(full["tasks"]),
+                                   "acceptance_map": len(p.build_ac_map(full["tasks"])["entries"])},
+                "mapping_review_required": False}
         if migrate_to_v4:
             full.setdefault("corrections", [])
             full["extensions"]["migration"] = {
@@ -1610,24 +2019,30 @@ def mutate(args, root, dry_run=False):
                    "writer": args.writer if keep_lease else "null",
                    "lease_until": iso(timestamp + timedelta(minutes=args.lease_minutes)) if keep_lease else "null",
                    "status": full["project"]["status"], **git_fields(git)}
-        if schema == p.SCHEMA_V4:
-            document_state, plans, scan_texts = relay_v4.plan_full(full, root,
-                                                                   meta["project_id"],
-                                                                   target_resolver)
+        if schema in relay_v4.EXTERNAL_SCHEMAS:
+            document_state, plans, scan_texts = relay_v4.plan_full(
+                full, root, meta["project_id"], target_resolver,
+                markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                source_revision=(int(meta["revision"]) if schema == p.SCHEMA_V5 else None))
         else:
             document_state, plans, scan_texts = full, [], []
         # Every new persistence path is secret scanned before anything is
         # published: object payloads, index nodes and manifests.
         for scan_text in scan_texts:
             scan(scan_text, enforce_limit=False)
+        # A v5 candidate is rendered from the same records that were just planned
+        # into objects, so the document can never disagree with the objects its
+        # index reference names.
         document_state, candidate, segments, compacted, preview_size, final_bytes = _plan_candidate(
             lines, body, document_state, updates, meta["project_id"],
-            force=args.command == "compact" or migrate_to_v4 or migrate_to_v3,
-            automatic=auto_enabled)
+            force=(args.command == "compact" or migrate_to_v4 or migrate_to_v3
+                   or migrate_to_v5),
+            automatic=auto_enabled,
+            markdown=markdown_records if schema == p.SCHEMA_V5 else None)
         if final_bytes > limit:
-            if schema == p.SCHEMA_V4:
+            if schema in relay_v4.EXTERNAL_SCHEMAS:
                 raise RelayError(RELAY_CURRENT_CAPACITY_EXCEEDED,
-                                 "candidate is " + str(final_bytes) + " bytes; the v4 limit is "
+                                 "candidate is " + str(final_bytes) + " bytes; the limit is "
                                  + str(limit))
             hint = "explicit migrate --to-v3 is required" if schema == p.SCHEMA_V2 else "business capacity requires review"
             p.require(False, f"document exceeds 64 KiB; candidate={preview_size}, after={final_bytes}, "
@@ -1669,6 +2084,11 @@ def mutate(args, root, dry_run=False):
         # merely because their directory name resembles sensitive content.
         result["history"] = Path(result["history"]).name
         result["warnings"] = published["warnings"] + archive_warnings + result.get("warnings", [])
+        if stub_regenerated:
+            result["warnings"].append(
+                "custom markdown stub was regenerated from the bound objects")
+        if markdown_change is not None:
+            result["markdown"] = {**markdown_change, "sections": len(markdown_records)}
         if final_bytes >= trigger:
             result["warnings"].append("capacity remains at or above the compaction trigger")
         if compacted and final_bytes > target:
@@ -1689,6 +2109,20 @@ def mutate(args, root, dry_run=False):
                              "soft_quota_bytes": storage["soft_quota_bytes"],
                              "hard_quota_bytes": storage["hard_quota_bytes"],
                              "disk_free_bytes": storage["disk_free_bytes"]}
+        # A best-effort, additive capacity receipt.  It never turns a committed
+        # write into a failure: if the next-cycle model cannot be built the
+        # estimate is named as not computed.
+        try:
+            nlines, nbody, nmeta = split(new, enforce_limit=False)
+            next_cycle = _next_save_cycle(nlines, nbody, document_state, nmeta, schema,
+                                          revision)
+        except (RelayError, p.Invalid, fs.Error, OSError, ValueError, KeyError, TypeError) as exc:
+            next_cycle = {"status": "not_computed",
+                          "reason": exc.code if isinstance(exc, RelayError) else "model unavailable"}
+        result["capacity"] = _capacity_receipt(
+            schema, before_bytes, final_bytes, committed=True,
+            object_store_new_bytes=published["bytes_written"],
+            archived_segments=len(segments), next_save_cycle=next_cycle)
         return {**result, "revision": revision, "schema": schema, "writer": updates["writer"],
                 "lease_until": updates["lease_until"], "replayed": False}
 
@@ -1697,7 +2131,8 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
     for command in ("init", "status", "validate", "resume", "update", "save", "compact",
-                    "migrate", "recover", "export", "verify", "capacity", "coverage", "handoff"):
+                    "migrate", "recover", "export", "verify", "capacity", "coverage", "handoff",
+                    "markdown"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--root", default=".")
         if command == "init":
@@ -1721,6 +2156,8 @@ def parser():
             cmd.add_argument("--apply", action="store_true")
             cmd.add_argument("--to-v3", action="store_true", help="upgrade a v2 document to the receipt-aware v3 format")
             cmd.add_argument("--to-v4", action="store_true", help="explicitly externalize evidence into the v4 object store")
+            cmd.add_argument("--to-v5", action="store_true",
+                             help="externalize custom Markdown and the acceptance map into the v5 object store")
             cmd.add_argument("--source-sha256")
         if command == "capacity":
             cmd.add_argument("--writer")
@@ -1728,6 +2165,9 @@ def parser():
             cmd.add_argument("--operation-id")
             cmd.add_argument("--lease-minutes", type=int, default=30)
             cmd.add_argument("--allow-drift", action="store_true")
+            cmd.add_argument("--input", help="JSON change file, or - for standard input; read-only patch preview")
+            cmd.add_argument("--long-record-threshold", type=int, default=None,
+                             help="UTF-8 byte threshold for the non-blocking long-record hint")
         if command == "coverage":
             cmd.add_argument("--task")
             cmd.add_argument("--limit", type=int, default=20)
@@ -1768,6 +2208,9 @@ def parser():
             cmd.add_argument("--output", required=True, help="new .zip destination; existing files are refused")
         if command == "verify":
             cmd.add_argument("--bundle", required=True, help="handoff .zip to validate")
+        if command == "markdown":
+            cmd.add_argument("--section", default=None,
+                             help="print one external Markdown section by its stable id")
     return result
 
 
@@ -1792,6 +2235,8 @@ def main(argv=None):
             result = coverage_view(args, root)
         elif args.command == "handoff":
             result = handoff_view(args, root)
+        elif args.command == "markdown":
+            result = markdown_view(args, root)
         elif args.command in ("compact", "migrate") and not args.apply and all(
                 value is not None for value in (args.writer, args.expected_revision, args.operation_id)):
             result = mutate(args, root, dry_run=True)
@@ -1801,7 +2246,8 @@ def main(argv=None):
             p.require(matches, "derived view conflict; review direct edits before compacting")
             archive = _archive_info(root, stub, meta)
             p.require(archive["integrity"] != "invalid", "receipt archive integrity check failed")
-            schema = p.SCHEMA_V4 if meta["schema"] == p.SCHEMA_V4 else p.SCHEMA_V3
+            schema = (meta["schema"] if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS
+                      else p.SCHEMA_V3)
             limit, _trigger, target = p.budget(schema)
             candidate_state, candidate, segments, would_compact, _, projected = _plan_candidate(
                 lines, body, stub, {"schema": schema}, meta["project_id"], force=True)
@@ -1815,7 +2261,35 @@ def main(argv=None):
                       "would_fit": projected <= limit, "archive_integrity": archive["integrity"]}
         elif args.command == "migrate" and not args.apply:
             old, lines, body, meta, state, _ = read_envelope(root)
-            if getattr(args, "to_v4", False):
+            if getattr(args, "to_v5", False):
+                if meta["schema"] == p.SCHEMA_V5:
+                    result = {"migration_required": False, "schema": p.SCHEMA_V5,
+                              "revision": int(meta["revision"])}
+                else:
+                    p.require(meta["schema"] == p.SCHEMA_V4,
+                              "v5 migration requires a v4 document; run --to-v4 first")
+                    source = relay_v4.expand(state, root, meta["project_id"])
+                    records = p.split_markdown(p.custom_region(body))
+                    resolver = relay_v4.make_target_resolver(root, meta["project_id"], state)
+                    stub, plans, _texts = relay_v4.plan_full(
+                        source, root, meta["project_id"], resolver,
+                        markdown=records, source_revision=int(meta["revision"]))
+                    _st, candidate, planned_segments, _wc, _ung, projected = _plan_candidate(
+                        lines, body, stub, {"schema": p.SCHEMA_V5}, meta["project_id"],
+                        force=True, markdown=records)
+                    checked(candidate)
+                    result = {"dry_run": True,
+                              "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
+                              "from_schema": meta["schema"], "to_schema": p.SCHEMA_V5,
+                              "revision": int(meta["revision"]),
+                              "candidate_bytes": projected,
+                              "planned_segments": len(planned_segments),
+                              "markdown_sections": len(records),
+                              "markdown_bytes": sum(r["bytes"] for r in records),
+                              "objects": {"planned": len(plans),
+                                          "unique_new_bytes": obs.plan_bytes(plans)},
+                              "mapping_review_required": False}
+            elif getattr(args, "to_v4", False):
                 if meta["schema"] == p.SCHEMA_V4:
                     result = {"migration_required": False, "schema": p.SCHEMA_V4,
                               "revision": int(meta["revision"])}

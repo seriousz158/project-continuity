@@ -35,6 +35,18 @@ RELAY_CORRECTION_TARGET_UNREACHABLE = "RELAY_CORRECTION_TARGET_UNREACHABLE"
 # A relationship target claimed by two different corrections in one commit.
 RELAY_CORRECTION_TARGET_CONFLICT = "RELAY_CORRECTION_TARGET_CONFLICT"
 
+# A v5 document declares the digest of its externalised Markdown but the bound
+# section objects no longer reproduce it: the text was changed, reordered or
+# replaced without the document being rewritten.
+RELAY_MARKDOWN_DIGEST_MISMATCH = "RELAY_MARKDOWN_DIGEST_MISMATCH"
+
+# The document's acceptance map disagrees with the acceptance conditions the
+# tasks actually carry.  The AC identity is a stable function of the task id and
+# the condition text, so a mismatch means a recorded coverage relationship no
+# longer names the text it was minted for.  It is a binding defect, never a
+# silent difference.
+RELAY_AC_MAP_MISMATCH = "RELAY_AC_MAP_MISMATCH"
+
 # A pagination cursor minted for a different document revision, content hash,
 # schema or filter.  Pages of different identities are never concatenated.
 RELAY_PAGE_CURSOR_STALE = "RELAY_PAGE_CURSOR_STALE"
@@ -43,6 +55,11 @@ RELAY_PAGE_CURSOR_STALE = "RELAY_PAGE_CURSOR_STALE"
 RELAY_STORAGE_QUOTA_EXCEEDED = "RELAY_STORAGE_QUOTA_EXCEEDED"
 RELAY_DISK_SPACE_INSUFFICIENT = "RELAY_DISK_SPACE_INSUFFICIENT"
 RELAY_CURRENT_CAPACITY_EXCEEDED = "RELAY_CURRENT_CAPACITY_EXCEEDED"
+
+# A read-only patch preview was asked for while another writer holds a live
+# lease.  The preview never predicts a commit that the lease would reject, and
+# it never takes the lease over.
+RELAY_PREVIEW_LEASE_CONFLICT = "RELAY_PREVIEW_LEASE_CONFLICT"
 
 # Refusals that belong to the write/validation contract rather than to
 # corruption of already-committed bytes.
@@ -63,6 +80,7 @@ CORRUPTION_CODES = frozenset({
     RELAY_OBJECT_LIMIT_EXCEEDED,
     RELAY_OBJECT_PATH_INVALID,
     RELAY_OBJECT_TYPE_INVALID,
+    RELAY_AC_MAP_MISMATCH,
 })
 
 
