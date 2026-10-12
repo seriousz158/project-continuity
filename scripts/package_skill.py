@@ -10,7 +10,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 ARCHIVE_ROOT = "project-continuity"
 FILES = (
     ".gitignore",

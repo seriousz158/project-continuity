@@ -4,7 +4,8 @@ Run from the installed skill directory, replacing `<project>`, IDs, and
 revision numbers with values you have actually read.
 
 ```bash
-# Explicit initialization only
+# Explicit initialization only.  Writes v6; --schema v2 keeps the legacy
+# inline format.
 python scripts/write_current.py init --root <project>
 
 # Read-only; neither command initializes state
@@ -36,6 +37,24 @@ python scripts/write_current.py prune --apply --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id> \
   --input prune-manifest.json
 
+# v6 only: archive one user extension key instead of writing a tombstone.
+# Managed keys (compaction, ac_map, external_markdown, blocker_scope,
+# recovery_log, migration*) are refused.
+#   {"extensions": {"r1012": null}}
+
+# Read-only: list the v6 cold archive, or print archived records verbatim by
+# archive id or by original record id.
+python scripts/write_current.py archive --root <project> --limit 50 --offset 0
+python scripts/write_current.py archive --root <project> --id <record-id>
+
+# Garbage collection: a report by default, which writes nothing.  --apply needs
+# the live lease; it deletes history snapshots beyond --keep-history (default
+# 50) and objects that neither CURRENT nor a kept snapshot reaches.  Receipt
+# segments and unrecognized files are never collected.
+python scripts/write_current.py gc --root <project> --keep-history 50
+python scripts/write_current.py gc --apply --root <project> --keep-history 50 \
+  --writer <writer-id> --expected-revision <n>
+
 # Read-only capacity/receipt forecast. It never creates .relay or writes files.
 python scripts/write_current.py compact --root <project>
 
@@ -50,7 +69,17 @@ python scripts/write_current.py compact --apply --root <project> \
 python scripts/write_current.py markdown --root <project>
 python scripts/write_current.py markdown --root <project> --section <md-id>
 
-# Migration is a dry run unless --apply is present
+# Upgrade to the latest schema.  The dry run lists every remaining step,
+# previews the first one exactly and reports source_sha256.  --apply runs each
+# step as its own commit (operation ids <unique-id>.<step>); later steps bind
+# to the document the previous step committed.
+python scripts/write_current.py migrate --root <project> --to-latest
+python scripts/write_current.py migrate --root <project> --to-latest --apply \
+  --source-sha256 <hash-from-dry-run> \
+  --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
+
+# Single steps.  Migration is a dry run unless --apply is present.  Without a
+# flag, migrate converts a v1 document to v2.
 python scripts/write_current.py migrate --root <project>
 python scripts/write_current.py migrate --root <project> --apply \
   --source-sha256 <hash-from-dry-run> \
@@ -61,6 +90,12 @@ python scripts/write_current.py migrate --root <project> --apply \
 # requires; the v4 migration is never repeated.
 python scripts/write_current.py migrate --root <project> --to-v5
 python scripts/write_current.py migrate --root <project> --to-v5 --apply \
+  --source-sha256 <hash-from-dry-run> \
+  --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
+
+# Add the v6 cold archive to a v5 document.
+python scripts/write_current.py migrate --root <project> --to-v6
+python scripts/write_current.py migrate --root <project> --to-v6 --apply \
   --source-sha256 <hash-from-dry-run> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
 
@@ -75,9 +110,9 @@ python scripts/write_current.py recover --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id> \
   --reason "reviewed interrupted write"
 
-# Optional controlled handoff package. It contains CURRENT.md and only the
-# receipt segments reachable from its v3 chain; history, inbox, and locks stay
-# local. The destination must be a new .zip file.
+# Optional controlled handoff package. It contains CURRENT.md, the receipt
+# segments reachable from its chain and the reachable objects; history, inbox,
+# and locks stay local. The destination must be a new .zip file.
 python scripts/write_current.py export --root <project> \
   --output /path/to/project-continuity-handoff.zip
 python scripts/write_current.py verify --root <project> \
@@ -88,7 +123,10 @@ Add `--lease-minutes <positive-integer>` when the default 30 minutes is not
 appropriate. Add `--allow-drift` only after reviewing reported Git drift. For
 snapshot recovery, add `--snapshot <history-filename>`; never pass a path.
 Writes automatically archive older operation receipts when the candidate file
-is at or above 80% of 64 KiB, keeping the newest 32 receipts in `CURRENT.md`.
+is at or above 80% of its limit (64 KiB for v3, 32 KiB from v4), keeping the
+newest 32 receipts in `CURRENT.md` (16 on v6). Receipts move in batches of at
+least 16 unless the hard limit forces a smaller one. On v6 a candidate still
+at or above the trigger then moves finished records into the cold archive.
 Use `--no-auto-compact` on `resume`, `update`, or `save` for a single write when
 you need the pre-v3 fail-closed behavior. It never truncates project data; a
 candidate that still exceeds 64 KiB is rejected.
@@ -130,8 +168,13 @@ python scripts/write_current.py migrate --root <project> --to-v4 --apply \
 # Read-only derived views: no state, no second authority, no writes.
 # coverage reports the evidence x acceptance matrix from the shared judgement;
 # every row separates recorded coverage from current coverage and from a
-# verified baseline.
-python scripts/write_current.py coverage --root <project> [--task <id>] [--limit 20]
+# verified baseline.  Rows and the verification record carry an assurance
+# grade (claimed < ref_resolved < ref_bound < externally_checked); verified=true
+# needs ref_resolved or better, otherwise reason=evidence_self_reported.
+# --acknowledge-external declares that external references were checked
+# outside the CLI and grades them externally_checked.
+python scripts/write_current.py coverage --root <project> [--task <id>] [--limit 20] \
+  [--acknowledge-external] [--verify-integrity]
 
 # handoff pages tasks, blockers, uncovered acceptance and evidence separately
 # and reports total/has_more for each.  complete=false whenever any page is
@@ -174,7 +217,7 @@ named `not_computed` reason). An idempotent replay reports the current
 occupancy with `committed=false` and `replayed=true`; it is never presented as
 a fresh commit.
 
-A v4 write commits CURRENT.md at or below 32768 bytes.  `capacity` always
+A v4, v5 or v6 write commits CURRENT.md at or below 32768 bytes.  `capacity` always
 carries the next operation receipt in its model; a preview that omitted the
 operation metadata is never presented as proof that the next commit fits.
 `handoff` fails by name when a bound object or index reference is missing; it

@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.5.0 - 2026-10-11
+
+Capacity governance round: a lossless cold archive, explicit garbage
+collection, graded evidence assurance and a one-command upgrade.
+
+### Breaking changes
+
+- `verified` is stricter.  The verification record of `coverage` and `handoff`
+  now has a mandatory `references` check and an `assurance` grade
+  (`claimed` < `ref_resolved` < `ref_bound` < `externally_checked`).
+  `verified=true` additionally needs every contributing evidence reference at
+  `ref_resolved` or better; a free-text or missing-path reference reports
+  `verified=false` with `reason=evidence_self_reported` and the self-reported
+  evidence ids.  Reports that were `true` for plain-text references become
+  `false`.  The completion gate is unchanged: a claimed pass still lets a task
+  become done.
+- `init` writes `project-continuity/v6`.  `init --schema v2` keeps the legacy
+  inline format.  Builds before 0.5.0 refuse v6 by name.
+- `status`, `handoff` and `coverage` report an absent writer or lease as JSON
+  `null` instead of the string `"null"`.
+- On v6, `"extensions": {"key": null}` archives and removes that key instead
+  of storing a null value.  Managed keys are refused.
+
+### Added
+
+- Schema `project-continuity/v6` with a cold archive.  A write that stays at
+  or above the trigger after receipt compaction moves a referentially closed
+  set (finished tasks, resolved blockers, and the evidence, decisions and
+  corrections bound only to them) into content-addressed archive records,
+  oldest first, until it is below the target.  Nothing is deleted: the archive
+  is part of the logical state, `migrate_compare.py` folds it back in, and
+  `--verify-integrity` re-hashes every archived object.
+- `archive` command: page through the archive or print records verbatim with
+  `--id`.  `status` and `handoff` carry an archive summary.
+- `migrate --to-v6` (from v5) and `migrate --to-latest`, which previews the
+  whole remaining chain and applies every step as its own source-bound commit.
+- `gc` command: a report by default; `--apply` needs the live lease and
+  deletes history snapshots beyond `--keep-history` (default 50) and objects
+  that neither CURRENT nor a kept snapshot reaches.  Receipt segments and
+  unrecognized files are never collected; an unparseable hand-named snapshot
+  blocks object collection.
+- `prune` (explicit, referentially closed deletion of enumerated records) and
+  the verification-frequency rule ADR-T004-007, both previously shipped only
+  in local installs.
+- `examples/evidence.json`, a complete evidence patch for the example task.
+
+### Fixed
+
+- Receipt compaction no longer thrashes.  A document above the trigger whose
+  receipts could not reach the target wrote one tiny segment per commit (one
+  real project accumulated 208 segments).  Receipts now move only in batches of
+  at least 16, when the hard limit forces it, or on `compact --apply`; v6
+  keeps 16 inline instead of 32.
+- Index leaves are written 16 entries wide, so appending one record rewrites
+  one small leaf and its ancestors instead of a whole wide leaf (about 24 KiB per
+  evidence append before).  Wide leaves written by 0.4 stay readable.
+- Field errors name the missing fields and count the unexpected ones without
+  echoing values; identifier errors name the field; symlink refusals name the
+  offending path; a read-only `.relay` is reported as such.
+- Hand-written v1 documents with empty `writer:`/`lease_until:` lines are read
+  as having no lease.
+- `capacity` models growth for v2/v3 documents and for projects whose first
+  task is finished, instead of reporting the model as unavailable.
+- The package allowlist now contains every test module, and a test enforces it.
+- The Git fingerprint budget is 256 MiB (was 64 MiB).
+
+### Migration notes
+
+- Run `migrate --to-latest` (dry run), review the steps, then apply with the
+  reported `--source-sha256`.  Back up `.relay/` first.  v1 conversions still
+  set `mapping_review_required` and stay `UNVERIFIED` until reviewed.
+- After a migration, `recover --snapshot` accepts only snapshots of the new
+  schema; older snapshots remain readable files.
+- Expect `verified=false` with `evidence_self_reported` where evidence points
+  at free text; point evidence at files inside the project, at relay objects,
+  or acknowledge external checks explicitly.
+
 ## 0.4.0 - 2026-09-21
 
 Relay capacity and deep-check round.

@@ -74,7 +74,10 @@ class V05FixTests(unittest.TestCase):
         real.mkdir()
         (real / 'change.json').write_text('{}', encoding='utf-8')
         link = self.root / 'linked'
-        os.symlink(real, link)
+        try:
+            os.symlink(real, link)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks are unavailable on this platform')
         result = self.call('update', '--writer', 'agent:a', '--expected-revision', '1',
                            '--operation-id', 'op2', input_path=link / 'change.json', ok=False)
         error = json.loads(result.stdout or result.stderr)['error']

@@ -47,7 +47,8 @@ Project Continuity 把这些风险变成明确的协议校验，同时保持状�
 ├── CURRENT.md    # 完成切换后，当前项目进度的唯一权威
 ├── .gitignore    # 默认让运行态保留在本地
 ├── history/      # 不可覆盖的历史 revision
-├── receipts/     # v3 内容寻址的回执片段，默认只在本地
+├── receipts/     # v3+ 内容寻址的回执片段，默认只在本地
+├── objects/      # v4+ 内容寻址的证据、正文和冷归档
 └── inbox/        # 可选、尚未合并的 Agent 输入
 ```
 
@@ -111,7 +112,7 @@ python scripts/write_current.py save --root /path/to/project \
 
 每次成功写入都会增加 revision。下一次写入前重新读取 `status`。同一个 operation ID 只能在输入完全相同时安全重试。默认 lease 为 30 分钟；只有审查过报告的 Git 漂移后才能使用 `--allow-drift`。
 
-容量会自动治理：达到 64 KiB 的 80% 时，最新 32 条回执保留在当前文件，其余回执无损写入 `.relay/receipts/`，前提是已显式迁移为 v3。可以先预览或显式执行：
+容量会自动治理。新项目从 v6 开始，文档上限 32 KiB。达到上限的 80% 时，旧回执按每批至少 16 条无损写入 `.relay/receipts/`（当前文件保留 16 条）。如果文档仍高于这条线，已完成的任务、已解决的阻塞，以及只与它们相关的证据和决策会移入 `.relay/objects/` 下的无损冷归档；用 `archive --id <记录 ID>` 可以原样取回。回执压缩可以先预览或显式执行：
 
 ```bash
 python scripts/write_current.py compact --root /path/to/project
@@ -119,7 +120,7 @@ python scripts/write_current.py compact --apply --root /path/to/project \
   --writer agent-a --expected-revision 3 --operation-id compact-001
 ```
 
-不带 `--apply` 的 `compact` 完全只读。`resume`、`update` 和 `save` 支持单次 `--no-auto-compact`，但不会绕过硬上限。
+不带 `--apply` 的 `compact` 完全只读。`resume`、`update` 和 `save` 支持单次 `--no-auto-compact`，但不会绕过硬上限。history 快照和不再被引用的对象不会被自动删除：`gc` 报告可以释放多少空间，`gc --apply`（需持有 lease）删除最新 50 个以外的快照，以及任何保留版本都不再引用的对象。
 
 如需明确地跨客户端传递，可导出并校验受控交接包；history、inbox、锁和备份仍保留在本地：
 
@@ -140,8 +141,11 @@ python scripts/write_current.py verify --bundle /tmp/project-continuity-handoff.
 | 记录任务或阻塞变化 | 使用稳定 ID 执行结构化 `update` |
 | 交给另一个 Agent | 用 `save` 记录已验证状态并释放 lease |
 | 新会话继续 | `status` → 读取下一步和阻塞 → `resume` |
-| 转换 v1 relay | `migrate` dry-run → 审查源哈希 → 显式 apply |
-| 启用回执 v3 | `migrate --to-v3` dry-run → 审查源哈希 → 显式 apply（自动治理前必须显式迁移） |
+| 升级已有 relay | 备份 `.relay/` → `migrate --to-latest` dry-run → 审查步骤和源哈希 → 显式 apply |
+| 转换 v1 relay | `migrate --to-latest`（或 `migrate`）→ 切换前复核 `mapping_review_required` |
+| 查看归档历史 | `archive` 列表，`archive --id <记录 ID>` 原样取回单条 |
+| 回收磁盘空间 | `gc` 报告 → 审查 → 持有 lease 时 `gc --apply` |
+| 判断证据强度 | `coverage` 每行的 `assurance`；引用能解析到才会 `verified` |
 | 中断后修复 | `status` + `validate` → lease 过期后才 `recover` |
 
 ## 核心保证
@@ -155,7 +159,8 @@ python scripts/write_current.py verify --bundle /tmp/project-continuity-handoff.
 | 重试安全 | operation ID 与输入哈希形成幂等回执 |
 | 完成必须有证据 | 校验验收覆盖和任务 generation |
 | 崩溃安全提交 | 旧版本快照、临时文件、同步和原子替换 |
-| 协议增长有界 | 达到 80% 容量时保留最新 32 条回执，其余完整写入内容寻址归档链 |
+| 协议增长有界 | 达到 80% 容量时回执分批写入内容寻址归档链；v6 还会把已完成记录移入无损冷归档 |
+| 验证结论不夸大 | 每条证据引用分级（`claimed` 到 `externally_checked`），只是自述的引用不会被报告为 verified |
 | 接棒时识别 Git 漂移 | 分开识别 branch、HEAD、index、tracked bytes、dirty 与 untracked |
 | 保守处理输入 | 路径/链接检查、64 KiB 上限和常见秘密扫描 |
 
@@ -221,7 +226,7 @@ python scripts/write_current.py --help
 
 ## 验证情况
 
-`v0.2.0` 包含 66 项测试，覆盖批量归档增长、历史重试、存储故障注入和干净发行包运行。
+`v0.5.0` 包含 250 项测试，覆盖 v6 冷归档及其无损迁移、回执分批、垃圾回收、证据分级、历史重试、存储故障注入和干净发行包运行。
 [CI 矩阵](https://github.com/seriousz158/project-continuity/actions/workflows/ci.yml)
 覆盖 macOS、Linux、Windows × Python 3.11–3.13；具体提交的结果见 Release Notes。
 私有历史快照容量演练保留了项目记录与自定义正文，没有应用待处理业务补丁，也不代表真实项目切换。
@@ -229,7 +234,7 @@ python scripts/write_current.py --help
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.2.0.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.5.0.zip
 ```
 
 确定性打包器只包含 allowlist 文件，同时生成 SHA-256 sidecar；如果压缩包或校验文件已存在，它会拒绝覆盖。

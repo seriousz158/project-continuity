@@ -137,6 +137,70 @@ limit for v4 and v5, the 64 KiB protocol ceiling is untouched, and the 24576
 byte governance target stays an observation target rather than a limit that
 would justify dropping history.
 
+## v6 cold archive
+
+Schema "project-continuity/v6" adds one collection to v5, `archive`, an index
+reference of the same shape as `evidence`.  `init` writes v6, and
+`migrate --to-v6` (from v5) or `migrate --to-latest` (from any older schema)
+reaches it explicitly.  Older builds refuse v6 by name and write nothing.
+
+    CURRENT.md -> archive index ref -> immutable archive records
+
+Each archive record (`project-continuity/archive-record/v1`) keeps one hot
+record verbatim with `collection`, `record_id`, `archived_at_revision` and
+`reason`; its id is derived from the collection, the record id and the
+revision, so the same move is never stored twice.  Archiving is lossless: the
+logical state is the hot document plus its archive, `archive --id <id>` prints a
+record exactly as it was, and `migrate_compare.py` folds the archive back in
+before comparing.  Appending reads only index nodes; `--verify-integrity`
+re-hashes every archived object.
+
+A v6 write whose candidate stays at or above the trigger after receipt
+compaction archives a closed set, oldest first, until it is below the target:
+
+  * done or cancelled tasks that are not `current_task`, that no hot task
+    depends on and that no open blocker names in its scope;
+  * resolved blockers (also those of live tasks) and every blocker of an
+    archived task, together with their `blocker_scope` entries;
+  * the evidence of archived tasks, decisions whose `task_ids` are all
+    archived, and corrections bound only to archived records.
+
+A decision or correction that spans a hot and a cold record keeps the whole set
+hot; no hot record ever points into the archive.  The acceptance map is rebuilt
+from the remaining tasks.
+
+User extensions are archived only on request: on v6 an update with
+`"extensions": {"key": null}` moves that key into the archive and removes it.
+Managed keys (`compaction`, `ac_map`, `external_markdown`, `blocker_scope`,
+`recovery_log`, `migration*`) are refused.  Before v6 a null extension value is
+still stored as a value.
+
+v6 keeps 16 receipts inline after a compaction (32 before v6), and every schema
+compacts receipts only in batches of at least 16, when the hard limit forces
+it, or on `compact --apply`, so a document hovering above the trigger no longer
+writes one tiny segment per commit.
+
+## Evidence assurance
+
+`coverage` and `handoff` grade each evidence reference, and each coverage row
+and the verification record carry the lowest grade among their contributors:
+
+  * `claimed`: free text, or a path that does not exist inside the project;
+  * `ref_resolved`: every path of the reference (`;`-separated, with `#anchor`
+    or `:line` suffixes ignored) exists inside the project root.  Only
+    existence is checked, never content;
+  * `ref_bound`: the reference names a content-addressed object or manifest
+    that resolved and verified;
+  * `externally_checked`: the caller passed `--acknowledge-external`.
+
+The `references` check is mandatory.  `verified=true` therefore needs the
+coverage, baseline and mapping checks and an assurance of `ref_resolved` or
+better; otherwise the record reports `reason=evidence_self_reported` and lists
+the self-reported evidence ids.  The completion gate is unchanged: a claimed
+pass still lets a task become done.  The gate decides whether work may be
+recorded as finished; the verification record reports how much of that claim
+the tool could check.
+
 ## Effective evidence and correction targets
 
 Four judgements are kept separate and never substitute for each other:
@@ -190,17 +254,20 @@ CURRENT replacement, so verification and commit cannot drift apart.
 
 ## Storage
 
-`.relay/CURRENT.md` contains schema `project-continuity/v2` (the default) or
-`project-continuity/v3` (receipt-aware), metadata, one authoritative JSON block,
-and one derived Markdown view. The view is regenerated from JSON and is never
+`.relay/CURRENT.md` contains a schema from `project-continuity/v2` to
+`project-continuity/v6` (`init` writes v6; `init --schema v2` the legacy inline
+format), metadata, one authoritative JSON block, and one derived Markdown view. The view is regenerated from JSON and is never
 parsed as state. The maximum document size is 64 KiB. History snapshots are
 append-only records of prior revisions.
 
 When the candidate reaches 80% of the limit, the CLI automatically keeps the
 newest 32 operation receipts in `CURRENT.md` and writes older receipts as
-content-addressed JSONL segments under `.relay/receipts/`. Explicit `migrate --to-v3 --apply` is required before automatic governance; old v2 clients reject v3 instead of silently losing
-retry protection. Tasks, blockers, evidence, decisions, extensions, and custom
-Markdown are never automatically removed or moved. The target after a
+content-addressed JSONL segments under `.relay/receipts/` (v6 keeps 16).
+Receipt-aware schemas (v3 and later) are required before automatic governance;
+old v2 clients reject them instead of silently losing retry protection. Before
+v6, tasks, blockers, evidence, decisions, extensions, and custom Markdown are
+never automatically moved; v6 moves finished records into its lossless cold
+archive (see "v6 cold archive") and never removes anything. The target after a
 successful compaction is 70%; if business content alone does not fit, the
 write fails closed.
 
@@ -236,8 +303,8 @@ reported conservatively and must not be presented as verified v2 evidence.
 - `decisions`: immutable ID, related task IDs, conclusion, and reason.
 - `extensions`: namespaced project-specific data.
 
-Typed changes are partial upserts by ID; they cannot delete records, remove
-acceptance criteria, choose arbitrary document paths, rewrite evidence, or
+Typed changes are partial upserts by ID; they cannot delete records (on v6 a
+null extension value archives that key), remove acceptance criteria, choose arbitrary document paths, rewrite evidence, or
 rewrite decisions. Reopening a final task requires a reason and increments its
 generation, invalidating earlier evidence for completion.
 
@@ -264,6 +331,27 @@ packages `CURRENT.md`, a manifest, and only chain-reachable receipt segments.
 It never includes `history/`, `inbox/`, locks, or backups. `verify --bundle`
 validates entry paths, checksums, schema, and the receipt chain in a temporary
 directory without modifying the target project.
+
+## Garbage collection
+
+History snapshots and object files are never deleted implicitly.  `gc` reports
+what an explicit collection would free and writes nothing.  `gc --apply` needs
+`--writer` holding the live lease and `--expected-revision`, runs under the
+relay lock, re-plans there, and never changes `CURRENT.md`:
+
+  * it keeps the newest `--keep-history` snapshots named `r<rev>-<sha>.md`
+    (default 50) and deletes older ones;
+  * it deletes an object file only when neither CURRENT nor any kept snapshot
+    reaches it, so `recover --snapshot` keeps working for every kept snapshot;
+  * receipt segments, files that are not named like relay objects or
+    snapshots, links and directories are never collected;
+  * a reachable object that is already missing stops the whole collection, and
+    a hand-named history file that cannot be parsed blocks object collection
+    because its references cannot be proven.
+
+Recovery from a snapshot still requires the same external schema, so after a
+migration only the snapshots written since then can be recovered with
+`--snapshot`; older ones remain readable files.
 
 ## Concurrency and recovery
 
@@ -301,7 +389,7 @@ evidence that the tree is clean.
 
 ### Capacity retention semantics
 
-The 32-receipt retention is a post-compaction target, not a validation limit.
+The 32-receipt retention (16 on v6) is a post-compaction target, not a validation limit.
 Below 52,429 bytes, v3 may accumulate more receipts without archiving.
 Governance may compact managed JSON and use a compact derived view; custom
 Markdown remains unchanged. Compact previews without operation parameters are
@@ -355,7 +443,10 @@ store.
 ### Long-running projects
 
 Archive validation is linear in committed receipt history. Segments are batched
-at the byte threshold, not created on every update. There is no persistent
-index, automatic archive deletion, or distributed locking. Export/verify use
+(at least 16 receipts unless the hard limit forces a write), not created on
+every update. Index leaves are written 16 entries wide, so an append rewrites
+one small leaf and its ancestors. Nothing is deleted automatically; `gc` is the
+explicit way to drop old history and unreachable objects. There is no
+distributed locking. Export/verify use
 matching uncompressed budgets; a project can outgrow the bundle budget even
 while CURRENT remains small. Transfer must then be planned explicitly.

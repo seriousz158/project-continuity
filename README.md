@@ -56,7 +56,8 @@ keeping the project state small enough for humans to review.
 ├── CURRENT.md    # sole authority for current project progress after cutover
 ├── .gitignore    # keeps local runtime data local by default
 ├── history/      # immutable prior revisions
-├── receipts/     # content-addressed receipt segments (v3, local by default)
+├── receipts/     # content-addressed receipt segments (v3+, local by default)
+├── objects/      # content-addressed evidence, Markdown and cold archive (v4+)
 └── inbox/        # optional, unmerged agent input
 ```
 
@@ -131,9 +132,13 @@ next write. An operation ID may be retried only with identical input. The
 default lease lasts 30 minutes; `--allow-drift` is valid only after the reported
 Git drift has been reviewed.
 
-Capacity is handled automatically: at 80% of 64 KiB the newest 32 receipts are
-kept inline and older receipts are moved losslessly to `.relay/receipts/`, which
-requires prior explicit migration to v3. Preview or explicitly request the same operation with:
+Capacity is handled automatically. A new project starts on v6, whose document
+limit is 32 KiB. At 80% of the limit older operation receipts move losslessly to
+`.relay/receipts/` in batches of at least 16 (16 stay inline). If the document
+is still above that line, finished tasks, resolved blockers and the evidence and
+decisions bound only to them move into a lossless cold archive under
+`.relay/objects/`; `archive --id <record-id>` prints any of them verbatim.
+Preview or explicitly request receipt compaction with:
 
 ```bash
 python scripts/write_current.py compact --root /path/to/project
@@ -143,7 +148,9 @@ python scripts/write_current.py compact --apply --root /path/to/project \
 
 `compact` without `--apply` is read-only. A one-off `--no-auto-compact` option
 is available on `resume`, `update`, and `save`; it never bypasses the hard
-limit.
+limit. History snapshots and unreferenced objects are never deleted
+automatically; `gc` reports what could be freed and `gc --apply` (with the live
+lease) deletes snapshots beyond the newest 50 and objects nothing kept reaches.
 
 For an explicit cross-client transfer, export and verify a controlled bundle;
 history, inbox, locks, and backups remain local:
@@ -167,8 +174,11 @@ reviewed Git drift.
 | Record task or blocker progress | `update` with typed changes by stable ID |
 | Hand work to another agent | Record verified state with `save`; the lease is released |
 | Continue in a fresh session | `status` → read next step and blockers → `resume` |
-| Convert a v1 relay document | `migrate` dry run → review exact source hash → explicit apply |
-| Enable receipt-aware v3 | `migrate --to-v3` dry run → review source hash → explicit apply (required before automatic compaction) |
+| Upgrade an existing relay | Back up `.relay/` → `migrate --to-latest` dry run → review steps and source hash → explicit apply |
+| Convert a v1 relay document | `migrate --to-latest` (or `migrate`) → review `mapping_review_required` before cutover |
+| Read archived history | `archive` to list, `archive --id <record-id>` for one record verbatim |
+| Reclaim disk space | `gc` report → review → `gc --apply` with the live lease |
+| Check how strong the evidence is | `coverage`: `assurance` per row; `verified` needs references that resolve |
 | Repair after interruption | `status` + `validate` → `recover` only after lease expiry |
 
 ## Core guarantees
@@ -182,7 +192,8 @@ reviewed Git drift.
 | Safe retries | Operation ID and input hash produce an idempotent receipt |
 | Evidence-backed completion | Acceptance coverage and task generation are validated |
 | Crash-safe commit | Prior-version snapshot, temporary file, sync, and atomic replacement |
-| Bounded protocol growth | At 80% capacity, newest 32 receipts stay inline and older receipts move to a content-addressed chain |
+| Bounded protocol growth | At 80% capacity receipts move to a content-addressed chain in batches; on v6 finished records move to a lossless cold archive |
+| Honest verification | Each evidence reference is graded `claimed` to `externally_checked`; `verified` is never claimed for self-reported references |
 | Git-aware resume | Branch, HEAD, index, tracked bytes, dirty and untracked state are distinguished |
 | Conservative input handling | Path/link checks, 64 KiB document limit, and common-secret detection |
 
@@ -276,7 +287,8 @@ from the installed directory.
 
 ## Verification
 
-The receipt-aware `v0.2.0` suite covers 66 tests, including batch archive growth,
+The `v0.5.0` suite covers 250 tests, including the v6 cold archive and its
+lossless migration, receipt batching, garbage collection, evidence assurance,
 archived retries, injected storage failures, and clean package execution.
 The [CI matrix](https://github.com/seriousz158/project-continuity/actions/workflows/ci.yml)
 covers macOS, Linux and Windows on Python 3.11–3.13. See the release notes for
@@ -287,7 +299,7 @@ execution and actual model-session reload are separate verification levels.
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.2.0.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.5.0.zip
 ```
 
 The deterministic packager includes only its allowlisted source files and produces a
