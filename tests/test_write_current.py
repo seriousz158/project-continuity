@@ -35,7 +35,7 @@ def run(root, *args, patch=None):
 
 class CliTests(unittest.TestCase):
     def test_unicode_project_roundtrip(self):
-        self.call('init', '--name', '跨平台项目')
+        self.call('init', '--schema', 'v2', '--name', '跨平台项目')
         self.assertEqual(self.call('status')['project']['name'], '跨平台项目')
 
     def setUp(self):
@@ -52,22 +52,22 @@ class CliTests(unittest.TestCase):
         return result
 
     def init_resume(self):
-        self.call('init')
+        self.call('init', '--schema', 'v2')
         return self.call('resume', '--writer', 'agent:a', '--expected-revision', '0', '--operation-id', 'op1')
 
     def test_status_read_only_explicit_init(self):
         before = list(self.root.rglob('*'))
         self.assertFalse(self.call('status')['exists'])
         self.assertEqual(list(self.root.rglob('*')), before)
-        self.call('init')
+        self.call('init', '--schema', 'v2')
         current = self.root/'.relay/CURRENT.md'
         before = current.read_bytes()
-        self.call('init', ok=False)
+        self.call('init', '--schema', 'v2', ok=False)
         self.assertEqual(current.read_bytes(), before)
         self.call('validate')
 
     def test_empty_explicit_project_id_does_not_initialize(self):
-        self.call('init', '--project-id', '', ok=False)
+        self.call('init', '--schema', 'v2', '--project-id', '', ok=False)
         self.assertFalse((self.root / '.relay').exists())
 
     def test_update_save_handoff_and_replay(self):
@@ -134,7 +134,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(self.call('migrate')['migration_required'])
 
     def test_concurrent_init_and_resume(self):
-        commands = [[sys.executable, str(SCRIPT), 'init', '--root', str(self.root)] for _ in range(2)]
+        commands = [[sys.executable, str(SCRIPT), 'init', '--schema', 'v2', '--root', str(self.root)] for _ in range(2)]
         jobs = [subprocess.Popen(c, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for c in commands]
         [job.communicate(timeout=30) for job in jobs]
         self.assertEqual(sum(job.returncode == 0 for job in jobs), 1)
@@ -154,7 +154,7 @@ class CliTests(unittest.TestCase):
 
     def test_git_same_head_dirty_drift(self):
         subprocess.run(['git','init','-q',str(self.root)],check=True)
-        self.call('init')
+        self.call('init', '--schema', 'v2')
         (self.root/'untracked.txt').write_text('first', encoding="utf-8")
         self.call('resume','--writer','a','--expected-revision','0','--operation-id','r',ok=False)
         self.call('resume','--writer','a','--expected-revision','0','--operation-id','r','--allow-drift')

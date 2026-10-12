@@ -56,6 +56,7 @@ FILES = (
     "tests/test_storage.py",
     "tests/test_v05_fixes.py",
     "tests/test_v4_objects.py",
+    "tests/test_v6_archive.py",
     "tests/test_write_current.py",
 )
 

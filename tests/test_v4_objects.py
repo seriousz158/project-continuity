@@ -44,7 +44,7 @@ class V4Case(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.assertEqual(self.call("init", "--name", "v4 fixture")[0], 0)
+        self.assertEqual(self.call("init", "--schema", "v2", "--name", "v4 fixture")[0], 0)
 
     def call(self, *args, patch=None, expect=0):
         argv = list(args)
@@ -273,7 +273,7 @@ class V4ObjectStoreTests(V4Case):
             obs.read_object(self.root, "proj-b", "evidence", entry, obs.Budget())
         self.assertEqual(caught.exception.code, "RELAY_OBJECT_PROJECT_MISMATCH")
         with self.assertRaises(cli.RelayError) as caught:
-            obs.object_path(self.root, "archive", "0" * 64)
+            obs.object_path(self.root, "not-a-record-type", "0" * 64)
         self.assertEqual(caught.exception.code, "RELAY_OBJECT_TYPE_INVALID")
 
     def test_index_branching_and_reference_cycle(self):
@@ -591,7 +591,7 @@ class V4SafetyTests(V4Case):
                     code = cli.main(argv + ["--root", str(project)])
             return code, out.getvalue().strip(), err.getvalue()
 
-        self.assertEqual(at_root("init", "--name", "ignore check")[0], 0)
+        self.assertEqual(at_root("init", "--schema", "v2", "--name", "ignore check")[0], 0)
         self.assertEqual(at_root("resume", "--writer", "w", "--expected-revision", "0",
                                  "--operation-id", "r0")[0], 0)
         self.assertEqual(at_root("save", "--writer", "w", "--expected-revision", "1",

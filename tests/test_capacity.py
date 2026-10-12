@@ -16,7 +16,7 @@ class CapacityTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.assertEqual(self.call("init")[0], 0)
+        self.assertEqual(self.call("init", "--schema", "v2")[0], 0)
 
     def call(self, *args, patch=None):
         output, errors = io.StringIO(), io.StringIO()

@@ -53,7 +53,7 @@ class V5Case(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.assertEqual(self.call("init", "--name", "v5 fixture")[0], 0)
+        self.assertEqual(self.call("init", "--schema", "v2", "--name", "v5 fixture")[0], 0)
 
     def call(self, *args, patch=None, expect=0, script=None):
         argv = [sys.executable, "-B", str(script or WRITE), *args, "--root", str(self.root)]

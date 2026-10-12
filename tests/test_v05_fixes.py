@@ -92,7 +92,7 @@ class V05FixTests(unittest.TestCase):
         self.assertEqual([task['status'] for task in tasks], ['done'])
 
     def test_growth_model_works_when_the_first_task_is_done(self):
-        self.call('init')
+        self.call('init', '--schema', 'v2')
         self.leased(0, 'op1')
         patch = {'tasks': [{'id': 'done-task', 'title': 'x', 'status': 'done',
                             'acceptance': ['works']},

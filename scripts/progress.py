@@ -28,7 +28,19 @@ SCHEMA_V4 = "project-continuity/v4"
 # document produces exactly the logical state its v4 predecessor produced; only
 # the on-disk representation changes, and old clients refuse v5 by name.
 SCHEMA_V5 = "project-continuity/v5"
-SUPPORTED_SCHEMAS = (SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5)
+# v6 keeps the v5 representation and adds a cold archive: finished tasks,
+# resolved blockers and the records bound only to them move, losslessly, into
+# content-addressed objects reached from one index reference.  Old clients
+# refuse v6 by name.
+SCHEMA_V6 = "project-continuity/v6"
+SCHEMA_LATEST = SCHEMA_V6
+SUPPORTED_SCHEMAS = (SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6)
+# Capability sets; a later schema keeps every capability of its predecessor.
+RECEIPT_SCHEMAS = (SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6)
+EXTERNAL_SCHEMAS = (SCHEMA_V4, SCHEMA_V5, SCHEMA_V6)
+MARKDOWN_SCHEMAS = (SCHEMA_V5, SCHEMA_V6)
+ARCHIVE_SCHEMAS = (SCHEMA_V6,)
+ARCHIVE_RECORD_SCHEMA = "project-continuity/archive-record/v1"
 RECEIPT_SCHEMA = "project-continuity/receipts/v1"
 AC_MAP_SCHEMA = "project-continuity/ac-map/v1"
 MARKDOWN_SCHEMA = "project-continuity/markdown/v1"
@@ -71,6 +83,8 @@ KIND_STATE = {"revocation": CURRENT_REVOKED, "supersession": CURRENT_SUPERSEDED,
 
 
 RECEIPT_KEEP = 32
+# v6 keeps fewer receipts inline; replay still consults the archived chain.
+RECEIPT_KEEP_V6 = 16
 RECEIPT_SEGMENT_MAX = 128
 # Automatic compaction waits for a full batch so a document held above the
 # trigger by business data does not spill one receipt per write.
@@ -174,14 +188,19 @@ def keyed(rows, label):
 
 def budget(schema):
     """Return (document limit, compaction trigger, compaction target)."""
-    if schema in (SCHEMA_V4, SCHEMA_V5):
+    if schema in EXTERNAL_SCHEMAS:
         return V4_MAX_BYTES, V4_COMPACTION_TRIGGER_BYTES, V4_COMPACTION_TARGET_BYTES
     return MAX_BYTES, COMPACTION_TRIGGER_BYTES, COMPACTION_TARGET_BYTES
 
 
+def receipt_keep(schema):
+    """Receipts retained inline after a compaction, by schema."""
+    return RECEIPT_KEEP_V6 if schema in ARCHIVE_SCHEMAS else RECEIPT_KEEP
+
+
 def is_external_schema(schema):
     """Schemas whose committed logical state lives in the object store."""
-    return schema in (SCHEMA_V4, SCHEMA_V5)
+    return schema in EXTERNAL_SCHEMAS
 
 
 def is_external(state):
@@ -823,7 +842,7 @@ def validate(state, targets=None):
     # The key set is exact: every optional collection present in the document
     # widens the expectation, and a collection that is absent stays absent.
     allowed = {"project", *COLLECTIONS, "extensions", "operations"}
-    for optional in ("corrections", "ac_map", "markdown"):
+    for optional in ("corrections", "ac_map", "markdown", "archive"):
         if optional in state:
             allowed = allowed | {optional}
     require_fields(state, allowed, "state")
@@ -848,7 +867,8 @@ def validate(state, targets=None):
                 "invalid compaction head")
         require(type(compaction["count"]) is int and compaction["count"] >= 0, "invalid compaction count")
         require(compaction["head"] is not None or compaction["count"] == 0, "compaction head missing")
-        require(type(compaction["retained"]) is int and compaction["retained"] == RECEIPT_KEEP,
+        require(type(compaction["retained"]) is int
+                and compaction["retained"] in (RECEIPT_KEEP, RECEIPT_KEEP_V6),
                 "invalid compaction retention")
     _validate_ac_map(state["extensions"].get("ac_map"))
     _validate_external_markdown(state["extensions"].get("external_markdown"))
@@ -879,6 +899,10 @@ def validate(state, targets=None):
     if "markdown" in state:
         require(external, "an external markdown index requires an external document")
         _require_index_ref(state["markdown"], "markdown")
+    if "archive" in state:
+        # The archive stays a reference in the resolved state too: archived
+        # records are cold history, never part of the current logical state.
+        _require_index_ref(state["archive"], "archive")
     require(project["current_task"] is None or project["current_task"] in tasks, "current task missing")
     for task in tasks.values():
         require_fields(task, {"id", "title", "status", "owner", "depends_on", "acceptance", "reason", "generation"}, "task", required=(), managed=("generation",))
@@ -1112,6 +1136,116 @@ def prune(state, spec, expected_revision=None):
     if "ac_map" in out.get("extensions", {}):
         out["extensions"]["ac_map"] = build_ac_map(out["tasks"])
     return validate(out)
+
+
+ARCHIVE_COLLECTIONS = ("tasks", "blockers", "evidence", "decisions", "corrections", "extensions")
+# Extension keys owned by the protocol never leave the document.
+MANAGED_EXTENSIONS = ("compaction", "ac_map", "external_markdown", "blocker_scope",
+                      "recovery_log")
+
+
+def archive_record(collection, record_id, record, revision, reason):
+    """One immutable archive entry; the original record is kept verbatim."""
+    require(collection in ARCHIVE_COLLECTIONS, "invalid archive collection")
+    require(isinstance(record_id, str) and record_id, "invalid archive record id")
+    raw = "\u0000".join((collection, record_id, str(revision))).encode("utf-8")
+    return {"id": "a-" + hashlib.sha256(raw).hexdigest()[:24], "schema": ARCHIVE_RECORD_SCHEMA,
+            "collection": collection, "record_id": record_id, "record": copy.deepcopy(record),
+            "archived_at_revision": revision, "reason": reason}
+
+
+def _correction_tasks(correction, by_id, evidence_task, decision_tasks, seen=()):
+    """Task ids a correction is bound to; empty when it names no task record."""
+    tasks = set()
+    kind, target = correction["target_type"], correction["target_id"]
+    if kind == "evidence":
+        tasks.add(evidence_task.get(target))
+    elif kind == "decision":
+        tasks |= decision_tasks.get(target, set())
+    elif kind == "correction" and target in by_id and target not in seen:
+        tasks |= _correction_tasks(by_id[target], by_id, evidence_task, decision_tasks,
+                                   (*seen, correction["id"]))
+    if correction.get("replacement_id"):
+        tasks.add(evidence_task.get(correction["replacement_id"]))
+    tasks.discard(None)
+    return tasks
+
+
+def plan_archive(state, revision, reason, targets=None):
+    """Split a resolved state into (hot state, archive records); never deletes.
+
+    Cold records are finished tasks with everything bound only to them, plus
+    every resolved blocker.  A finished task stays hot while anything that
+    stays hot still refers to it: a dependent task, an open blocker's scope, a
+    decision or a correction that also names a hot task, or the current task.
+    """
+    require(isinstance(state.get("evidence"), list), "archiving requires resolved evidence")
+    corrections = state.get("corrections") if isinstance(state.get("corrections"), list) else []
+    tasks = {task["id"]: task for task in state["tasks"]}
+    current = state["project"]["current_task"]
+    cold = {key for key, task in tasks.items()
+            if task["status"] in ("done", "cancelled") and key != current}
+    evidence_task = {item["id"]: item["task_id"] for item in state["evidence"]}
+    decision_tasks = {item["id"]: set(item["task_ids"]) for item in state["decisions"]}
+    by_id = {item["id"]: item for item in corrections}
+    correction_tasks = {item["id"]: _correction_tasks(item, by_id, evidence_task, decision_tasks)
+                        for item in corrections}
+    scopes = _blocker_scopes(state["extensions"].get("blocker_scope"))
+    while True:
+        drop = set()
+        for key in set(tasks) - cold:
+            drop |= set(tasks[key]["depends_on"]) & cold
+        for blocker in state["blockers"]:
+            if blocker["status"] != "resolved" and blocker["task_id"] not in cold:
+                drop |= {item[5:] for item in scopes.get(blocker["id"], [])
+                         if item.startswith("task:")} & cold
+        for bound in [*decision_tasks.values(), *correction_tasks.values()]:
+            if bound & cold and bound - cold:
+                drop |= bound & cold
+        if not drop:
+            break
+        cold -= drop
+    moved = {"tasks": [task for task in state["tasks"] if task["id"] in cold],
+             "blockers": [item for item in state["blockers"]
+                          if item["status"] == "resolved" or item["task_id"] in cold],
+             "evidence": [item for item in state["evidence"] if item["task_id"] in cold],
+             "decisions": [item for item in state["decisions"]
+                           if item["task_ids"] and set(item["task_ids"]) <= cold],
+             "corrections": [item for item in corrections
+                             if correction_tasks[item["id"]]
+                             and correction_tasks[item["id"]] <= cold]}
+    hot = copy.deepcopy(state)
+    for name, records in moved.items():
+        if name == "corrections" and "corrections" not in state:
+            continue
+        gone = {item["id"] for item in records}
+        hot[name] = [item for item in hot[name] if item["id"] not in gone]
+    gone_blockers = {item["id"] for item in moved["blockers"]}
+    scope_value = hot["extensions"].get("blocker_scope")
+    if isinstance(scope_value, dict) and isinstance(scope_value.get("entries"), list):
+        scope_value["entries"] = [entry for entry in scope_value["entries"]
+                                  if entry.get("blocker_id") not in gone_blockers]
+    if "ac_map" in hot["extensions"]:
+        hot["extensions"]["ac_map"] = build_ac_map(hot["tasks"])
+    records = [archive_record(name, item["id"], item, revision, reason)
+               for name in ("tasks", "blockers", "evidence", "decisions", "corrections")
+               for item in moved[name]]
+    return validate(hot, targets), records
+
+
+def archive_extensions(state, keys, revision, reason):
+    """Explicitly move named extension namespaces into the archive."""
+    hot = copy.deepcopy(state)
+    records = []
+    for key in keys:
+        require(isinstance(key, str) and key not in MANAGED_EXTENSIONS
+                and not key.startswith("migration"),
+                "managed extension metadata cannot be archived")
+        require(key in hot["extensions"], "archived extension is missing")
+        records.append(archive_record("extensions", key,
+                                      {"key": key, "value": hot["extensions"].pop(key)},
+                                      revision, reason))
+    return hot, records
 
 
 def display(value):

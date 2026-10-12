@@ -123,8 +123,7 @@ def read_envelope(root):
     if meta["schema"] in p.SUPPORTED_SCHEMAS:
         state, matches = parsed_body(body)
         compaction = state["extensions"].get("compaction")
-        p.require((meta["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5))
-                  == (compaction is not None),
+        p.require((meta["schema"] in p.RECEIPT_SCHEMAS) == (compaction is not None),
                   "receipt archive metadata/schema mismatch")
         p.require(state["project"]["status"] == meta["status"], "metadata/project status conflict")
         if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS:
@@ -132,13 +131,15 @@ def read_envelope(root):
                       "an external document requires an external evidence index")
             p.require("corrections" not in state or isinstance(state["corrections"], dict),
                       "an external document requires an external corrections index")
-        if meta["schema"] == p.SCHEMA_V5:
+        if meta["schema"] in p.MARKDOWN_SCHEMAS:
             p.require(isinstance(state.get("markdown"), dict)
                       and isinstance(state.get("ac_map"), dict),
-                      "v5 requires external markdown and acceptance map indexes")
+                      "v5 requires external markdown and acceptance map indexes (v6 too)")
         else:
             p.require("markdown" not in state and "ac_map" not in state,
-                      "only a v5 document externalises markdown and the acceptance map")
+                      "only a v5 or v6 document externalises markdown and the acceptance map")
+        p.require((meta["schema"] in p.ARCHIVE_SCHEMAS) == isinstance(state.get("archive"), dict),
+                  "only a v6 document carries an archive, and it always does")
     else:
         state, matches = None, True
     return document, lines, body, meta, state, matches
@@ -364,8 +365,8 @@ def _archive_chain(root, state, meta):
     compaction = state["extensions"].get("compaction")
     if compaction is None:
         return []
-    p.require(meta["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5),
-              "receipt archive requires project-continuity/v3, v4 or v5")
+    p.require(meta["schema"] in p.RECEIPT_SCHEMAS,
+              "receipt archive requires project-continuity/v3 or later")
     p.validate(state)
     head = compaction["head"]
     if head is None:
@@ -425,10 +426,11 @@ def _archive_info(root, state, meta):
             "current": current, "retained": current, "reclaimable_bytes": 0}
 
 
-def _plan_compaction(state, project_id, force=False):
+def _plan_compaction(state, project_id, force=False, schema=None):
     """Build a deterministic archive plan without touching the filesystem."""
     operations = list(state["operations"])
-    move_count = max(0, len(operations) - p.RECEIPT_KEEP)
+    keep = p.receipt_keep(schema)
+    move_count = max(0, len(operations) - keep)
     records = operations[:move_count]
     compaction = state["extensions"].get("compaction")
     previous = compaction["head"] if compaction else None
@@ -446,7 +448,7 @@ def _plan_compaction(state, project_id, force=False):
     out = copy.deepcopy(state)
     out["operations"] = operations[move_count:]
     out["extensions"]["compaction"] = {"schema": p.RECEIPT_SCHEMA, "head": head,
-                                          "count": archived_count, "retained": p.RECEIPT_KEEP}
+                                          "count": archived_count, "retained": keep}
     p.validate(out)
     return out, segments, bool(records or force or compaction is not None)
 
@@ -491,20 +493,83 @@ def _plan_candidate(lines, body, state, updates, project_id, *, force=False, aut
     ungoverned_bytes = _candidate_bytes(candidate)
     segments, compacted = [], False
     limit, trigger, target = p.budget(updates["schema"])
-    surplus = len(state["operations"]) - p.RECEIPT_KEEP
-    if updates["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5) and (force or
+    surplus = len(state["operations"]) - p.receipt_keep(updates["schema"])
+    if updates["schema"] in p.RECEIPT_SCHEMAS and (force or
             (automatic and ungoverned_bytes >= trigger
              and (surplus >= p.RECEIPT_SEGMENT_MIN or ungoverned_bytes > limit))):
-        state, segments, compacted = _plan_compaction(state, project_id, force=True)
+        state, segments, compacted = _plan_compaction(state, project_id, force=True,
+                                                      schema=updates["schema"])
         candidate = render(state)
         if len(candidate.encode("utf-8")) > target:
             candidate = render(state, compact=True)
-    elif updates["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5) and automatic \
+    elif updates["schema"] in p.RECEIPT_SCHEMAS and automatic \
             and ungoverned_bytes >= trigger:
         # Deferred receipt compaction still keeps the derived view compact.
         candidate = render(state, compact=True)
     final_bytes = _candidate_bytes(candidate)
     return state, candidate, segments, compacted, ungoverned_bytes, final_bytes
+
+
+AUTO_ARCHIVE_REASON = "automatic: the document reached the compaction trigger"
+EXPLICIT_ARCHIVE_REASON = "explicit: extension namespace archived by the writer"
+
+
+def _plan_document(full, root, meta, schema, lines, body, updates, *, targets=None,
+                   markdown=None, source_revision=None, force=False, automatic=True,
+                   archive=()):
+    """The one planner shared by the commit and every preview of it.
+
+    Returns (resolved state, document state, object plans, scan texts,
+    candidate, receipt segments, compacted, ungoverned bytes, final bytes,
+    records archived automatically, candidate bytes before archiving).  On a v6
+    document a candidate at or above
+    the compaction trigger first moves its cold records into the archive; the
+    receipts are then governed as before.
+    """
+    external = schema in relay_v4.EXTERNAL_SCHEMAS
+    with_markdown = markdown if schema in p.MARKDOWN_SCHEMAS else None
+
+    def plan(state, records):
+        if external:
+            stub, plans, texts = relay_v4.plan_full(
+                state, root, meta["project_id"], targets, markdown=with_markdown,
+                source_revision=source_revision if with_markdown is not None else None,
+                archive=list(records) if schema in p.ARCHIVE_SCHEMAS else None)
+        else:
+            stub, plans, texts = state, [], []
+        planned = _plan_candidate(lines, body, stub, updates, meta["project_id"], force=force,
+                                  automatic=automatic, markdown=with_markdown)
+        return (stub, plans, texts) + planned[1:] + (planned[0],)
+
+    records = list(archive)
+    stub, plans, texts, candidate, segments, compacted, ungoverned, final, document = \
+        plan(full, records)
+    before_archive = ungoverned
+    moved = []
+    _limit, trigger, _target = p.budget(schema)
+    if schema in p.ARCHIVE_SCHEMAS and automatic and ungoverned >= trigger:
+        hot, moved = p.plan_archive(full, int(updates["revision"]), AUTO_ARCHIVE_REASON,
+                                    targets)
+        if moved:
+            full = hot
+            stub, plans, texts, candidate, segments, compacted, ungoverned, final, document = \
+                plan(full, records + moved)
+    return (full, document, plans, texts, candidate, segments, compacted, ungoverned, final,
+            moved, before_archive)
+
+
+def _extension_archive_keys(patch, schema):
+    """On v6 an extension set to null is archived and removed, never nulled."""
+    if schema not in p.ARCHIVE_SCHEMAS or not isinstance(patch, dict) \
+            or not isinstance(patch.get("extensions"), dict):
+        return patch, []
+    keys = [key for key, value in patch["extensions"].items() if value is None]
+    if not keys:
+        return patch, []
+    trimmed = dict(patch)
+    trimmed["extensions"] = {key: value for key, value in patch["extensions"].items()
+                             if value is not None}
+    return trimmed, keys
 
 
 def _capacity_sections(document, body):
@@ -548,8 +613,10 @@ def _reachable_object_names(root, meta, stub):
         return []
     names, budget = [], obs.Budget()
     fields = [("evidence", "evidence"), ("corrections", "correction")]
-    if meta["schema"] == p.SCHEMA_V5:
+    if meta["schema"] in p.MARKDOWN_SCHEMAS:
         fields.extend([("markdown", "markdown"), ("ac_map", "ac-map")])
+    if meta["schema"] in p.ARCHIVE_SCHEMAS:
+        fields.append(("archive", "archive"))
     for field, record_type in fields:
         ref = stub.get(field)
         if isinstance(ref, dict) and ref.get("index") is not None:
@@ -743,9 +810,11 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
     with a different (synthetic) baseline than the commit writes.
     """
     state = copy.deepcopy(state)
-    if patch and root is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS \
-            and p.is_external(state):
+    # A v6 commit may archive cold records, which needs the resolved state.
+    if root is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS \
+            and p.is_external(state) and (patch or meta["schema"] in p.ARCHIVE_SCHEMAS):
         state = relay_v4.expand(state, root, meta["project_id"])
+    extension_records = []
     if patch:
         if "prune" in patch:
             state = p.prune(state, patch["prune"])
@@ -756,8 +825,12 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
             p.text(project_patch["next_step"], "next_step", empty=True)
             state["project"]["next_step"] = project_patch["next_step"]
         else:
+            patch, extension_keys = _extension_archive_keys(patch, meta["schema"])
             state = p.apply(state, patch, git if git is not None else {"kind": "none"},
                             targets=targets)
+            if extension_keys:
+                state, extension_records = p.archive_extensions(
+                    state, extension_keys, revision, EXPLICIT_ARCHIVE_REASON)
     receipt = {"id": operation_id, "hash": "0" * 64, "revision": revision}
     state["operations"] = list(state["operations"]) + [receipt]
     status = state["project"]["status"]
@@ -782,13 +855,16 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
         # captured the same environment it must include them, or the predicted
         # byte count would silently exclude the front-matter change.
         updates.update(git_fields(git))
-    document_state = state
     if root is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS \
             and not p.is_external(state):
-        document_state, _plans, _texts = relay_v4.plan_full(
-            state, root, meta["project_id"], targets, markdown=markdown)
-    _candidate, projected, segments, would_compact = _plan_candidate_from_state(
-        lines, body, document_state, updates, meta["project_id"], markdown=markdown)
+        (state, document_state, _plans, _texts, _candidate, segments, would_compact,
+         _ungoverned, projected, _moved, _before) = _plan_document(
+            state, root, meta, meta["schema"], lines, body, updates, targets=targets,
+            markdown=markdown, archive=extension_records)
+    else:
+        document_state = state
+        _candidate, projected, segments, would_compact = _plan_candidate_from_state(
+            lines, body, document_state, updates, meta["project_id"], markdown=markdown)
     receipt_bytes = len(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     model_state = document_state if (root is not None and
                                      meta["schema"] in relay_v4.EXTERNAL_SCHEMAS) else state
@@ -1258,10 +1334,10 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
         return {"status": "unavailable", "reason": "Git inspection failed; preview refused"}
     md_patch = patch.get("markdown") if isinstance(patch, dict) else None
     markdown_records = None
-    if schema == p.SCHEMA_V5:
+    if schema in p.MARKDOWN_SCHEMAS:
         markdown_records = relay_v4.collect_markdown(stub, root, meta["project_id"])
     if md_patch is not None:
-        p.require(schema == p.SCHEMA_V5, "markdown changes require a v5 document")
+        p.require(schema in p.MARKDOWN_SCHEMAS, "markdown changes require a v5 document (or v6)")
         markdown_records, _change = p.merge_markdown(markdown_records, md_patch)
     apply_patch = ({key: value for key, value in patch.items() if key != "markdown"}
                    if md_patch is not None else patch)
@@ -1282,19 +1358,19 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
             update = _commit_model(meta, lines, body, full, "update", revision + 1,
                                    operation_id or "preview-prune", writer, lease_minutes, stamp,
                                    patch=apply_patch, git=git, targets=resolver,
-                                   markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                   markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
                                    root=root)
             save = _commit_model(meta, lines, body, update["state"], "save", revision + 2,
                                  (operation_id + "-save") if operation_id else "preview-save",
                                  writer, lease_minutes, stamp, git=git, targets=resolver,
-                                 markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                 markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
                                  root=root)
             steps, mode, commands = [update, save], "update-save", ["update", "save"]
         else:
             model = _commit_model(meta, lines, body, full, "save", revision + 1,
                                   operation_id or "preview-save", writer, lease_minutes, stamp,
                                   patch=apply_patch, git=git, targets=resolver,
-                                  markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                  markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
                                   root=root)
             steps, mode, commands = [model], "save", ["save"]
     else:
@@ -1307,13 +1383,13 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
             update = _commit_model(meta, lines, body, first["state"], "update", revision + 2,
                                    prune_op, writer, lease_minutes, stamp, patch=apply_patch,
                                    git=git, targets=resolver,
-                                   markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                   markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
                                    root=root)
             save_op = (operation_id + "-save") if operation_id else "preview-save"
             save = _commit_model(meta, lines, body, update["state"], "save", revision + 3,
                                  save_op, writer, lease_minutes, stamp, git=git,
                                  targets=resolver,
-                                 markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                 markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
                                  root=root)
             steps, mode, commands = [first, update, save], "cycle", ["resume", "update", "save"]
         else:
@@ -1321,7 +1397,7 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
             second = _commit_model(meta, lines, body, first["state"], "save", revision + 2,
                                    save_op, writer, lease_minutes, stamp, patch=apply_patch,
                                    git=git, targets=resolver,
-                                   markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                   markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
                                    root=root)
             steps, mode, commands = [first, second], "cycle", ["resume", "save"]
     summaries = [_step_summary(step, limit) for step in steps]
@@ -1576,8 +1652,8 @@ def markdown_view(args, root):
     p.require(stub is not None, "v1 is read-only; migrate before reading markdown")
     p.require(matches, "derived view conflict; review direct edits before reading markdown")
     selector = getattr(args, "section", None)
-    if meta["schema"] != p.SCHEMA_V5:
-        p.require(selector is None, "sections are addressable only on a v5 document")
+    if meta["schema"] not in p.MARKDOWN_SCHEMAS:
+        p.require(selector is None, "sections are addressable only on a v5 or v6 document")
         text = relay_v4.resolve_markdown(document, root)
         return {"schema": meta["schema"], "revision": int(meta["revision"]),
                 "external": False, "count": 0, "sections": [],
@@ -1710,8 +1786,50 @@ def handoff_view(args, root):
     result["baseline"] = block
     result["recorded_baseline"] = block["recorded"]
     result["observed_baseline"] = block["observed"]
+    archive = _archive_summary(stub, meta)
+    if archive is not None:
+        result["archive"] = archive
     scan(json.dumps(result, ensure_ascii=False), enforce_limit=False)
     return result
+
+
+def archive_view(args, root):
+    """Read-only: list the cold archive, or print archived records verbatim."""
+    document, lines, body, meta, stub, matches = read_envelope(root)
+    p.require(stub is not None and meta["schema"] in p.ARCHIVE_SCHEMAS,
+              "only a v6 document has an archive; migrate --to-latest first")
+    p.require(matches, "derived view conflict; review direct edits before reading the archive")
+    budget = obs.Budget()
+    entries = relay_v4.archive_entries(root, meta["project_id"], stub["archive"], budget)
+    wanted = getattr(args, "id", None)
+    if wanted is not None:
+        records = [obs.read_object(root, meta["project_id"], "archive", entry, budget)
+                   for entry in entries]
+        found = [record for record in records
+                 if wanted in (record["id"], record["record_id"])]
+        p.require(found, "no archived record has that id")
+        return {"schema": meta["schema"], "revision": int(meta["revision"]),
+                "content_is_data": True, "records": found, "count": len(found)}
+    limit = max(1, min(int(getattr(args, "limit", None) or 50), 500))
+    offset = max(0, int(getattr(args, "offset", None) or 0))
+    page = entries[offset:offset + limit]
+    items = []
+    for entry in page:
+        record = obs.read_object(root, meta["project_id"], "archive", entry, budget)
+        items.append({"id": record["id"], "collection": record["collection"],
+                      "record_id": record["record_id"],
+                      "archived_at_revision": record["archived_at_revision"],
+                      "reason": record["reason"], "object_bytes": entry["object_bytes"]})
+    return {"schema": meta["schema"], "revision": int(meta["revision"]),
+            "content_is_data": True, "total": len(entries), "offset": offset, "limit": limit,
+            "has_more": offset + len(page) < len(entries), "items": items}
+
+
+def _archive_summary(stub, meta):
+    if stub is None or meta["schema"] not in p.ARCHIVE_SCHEMAS:
+        return None
+    return {"count": stub["archive"]["count"], "index": stub["archive"]["index"],
+            "read": "write_current.py archive --root <project> [--id <record id>]"}
 
 
 def checked(document):
@@ -1723,17 +1841,35 @@ def checked(document):
     return document
 
 
+INIT_SCHEMAS = {"v2": p.SCHEMA_V2, "v6": p.SCHEMA_V6}
+
+
 def initialize(args, root):
     project_id = args.project_id if args.project_id is not None else str(uuid.uuid4())
     p.identifier(project_id)
+    schema = INIT_SCHEMAS[getattr(args, "schema", None) or "v6"]
     state = p.empty_state(args.name or "Project")
     current = fs.child(root, ".relay", "CURRENT.md")
     relay = fs.child(root, ".relay")
     current_git = git_state.capture(root)
     p.require(current_git["kind"] != "error", "Git inspection failed")
-    doc = checked(metadata([], {"schema": p.SCHEMA, "project_id": project_id, "revision": "0",
+    plans = []
+    body = p.render_body(state)
+    if schema == p.SCHEMA_V6:
+        # A new project starts on the latest schema directly: an empty object
+        # store, an empty Markdown region and archive, and v6 receipt metadata.
+        state["corrections"] = []
+        state["extensions"]["compaction"] = {"schema": p.RECEIPT_SCHEMA, "head": None,
+                                             "count": 0, "retained": p.receipt_keep(schema)}
+        state, plans, texts = relay_v4.plan_full(state, root, project_id, markdown=[],
+                                                 source_revision=0, archive=[])
+        for text in texts:
+            scan(text, enforce_limit=False)
+        body = p.render_body(state, p.render_region(p.render_body(state),
+                                                    p.render_markdown_stub([])))
+    doc = checked(metadata([], {"schema": schema, "project_id": project_id, "revision": "0",
                   "updated_at": iso(now()), "writer": "null", "lease_until": "null", "status": "active",
-                  **git_fields(current_git)}) + p.render_body(state))
+                  **git_fields(current_git)}) + body)
     relay.mkdir(mode=0o700, exist_ok=True)
     with fs.locked(fs.child(root, ".relay", "CURRENT.md.lock")):
         p.require(not current.exists(), "CURRENT.md already exists")
@@ -1741,9 +1877,10 @@ def initialize(args, root):
             fs.child(root, ".relay", name).mkdir(mode=0o700, exist_ok=True)
         ignore = fs.child(root, ".relay", ".gitignore")
         if not ignore.exists():
-            fs.atomic(ignore, "# Local by default. To share CURRENT.md only, replace * with /history/, /receipts/, /inbox/, /*.lock, /.*.tmp\n*\n")
-        warnings = fs.atomic(current, doc)
-    return {"revision": 0, "schema": p.SCHEMA, "warnings": warnings}
+            fs.atomic(ignore, "# Local by default. To share CURRENT.md only, replace * with /history/, /receipts/, /inbox/, /objects/, /*.lock, /.*.tmp\n*\n")
+        published = obs.publish(root, plans) if plans else {"warnings": []}
+        warnings = published["warnings"] + fs.atomic(current, doc)
+    return {"revision": 0, "schema": schema, "warnings": warnings}
 
 
 def _objects_info(root, meta, stub):
@@ -1873,11 +2010,15 @@ def status(args, root):
         result["object_error"] = {"error": object_error.code, "message": object_error.detail}
     inbox = fs.child(root, ".relay", "inbox")
     result["pending_inbox"] = len(list(inbox.iterdir())) if inbox.exists() else 0
+    archive_summary = _archive_summary(stub, meta)
+    if archive_summary is not None:
+        result["archive"] = archive_summary
     if resolved:
         result.update(p.summary(state, git))
-        preview_state, planned, would_compact = _plan_compaction(stub, meta["project_id"])
         schema = (meta["schema"] if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS
                   else p.SCHEMA_V3)
+        preview_state, planned, would_compact = _plan_compaction(stub, meta["project_id"],
+                                                                 schema=schema)
         if would_compact:
             preview = metadata(lines, {"schema": schema}) + p.render_body(preview_state, body)
             projected = len(preview.encode("utf-8"))
@@ -1978,6 +2119,8 @@ def mutate(args, root, dry_run=False):
         hash_input["to_v4"] = True
     if getattr(args, "to_v5", False):
         hash_input["to_v5"] = True
+    if getattr(args, "to_v6", False):
+        hash_input["to_v6"] = True
     operation_hash = p.digest(hash_input)
     # Never create relay or lock if CURRENT is absent.
     fs.child(root, ".relay", "CURRENT.md", exists=True)
@@ -1993,7 +2136,7 @@ def mutate(args, root, dry_run=False):
         markdown_change = None
         if state is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS:
             full = relay_v4.expand(state, root, meta["project_id"])
-            if meta["schema"] == p.SCHEMA_V5:
+            if meta["schema"] in p.MARKDOWN_SCHEMAS:
                 markdown_records = relay_v4.collect_markdown(state, root, meta["project_id"])
                 if markdown_patch is not None:
                     markdown_records, markdown_change = p.merge_markdown(
@@ -2009,6 +2152,7 @@ def mutate(args, root, dry_run=False):
         # is refused by name rather than accepted on its syntax.
         target_resolver = relay_v4.make_target_resolver(root, meta["project_id"], state)
         archived = []
+        extension_records = []
         if state:
             # A receipt still inline is sufficient to answer an idempotent
             # retry even if an unrelated old archive is degraded.
@@ -2052,14 +2196,21 @@ def mutate(args, root, dry_run=False):
         migrate_to_v3 = args.command == "migrate" and getattr(args, "to_v3", False)
         migrate_to_v4 = args.command == "migrate" and getattr(args, "to_v4", False)
         migrate_to_v5 = args.command == "migrate" and getattr(args, "to_v5", False)
-        p.require(sum((bool(migrate_to_v3), bool(migrate_to_v4), bool(migrate_to_v5))) <= 1,
+        migrate_to_v6 = args.command == "migrate" and getattr(args, "to_v6", False)
+        p.require(sum((bool(migrate_to_v3), bool(migrate_to_v4), bool(migrate_to_v5),
+                       bool(migrate_to_v6))) <= 1,
                   "choose one migration target")
-        p.require(markdown_patch is None or meta["schema"] == p.SCHEMA_V5,
-                  "markdown changes require a v5 document")
+        p.require(markdown_patch is None or meta["schema"] in p.MARKDOWN_SCHEMAS,
+                  "markdown changes require a v5 document (or v6)")
         if args.command == "migrate":
             p.require(not lease_active(meta), "active lease prevents migration")
             p.require(args.source_sha256 == hashlib.sha256(old.encode()).hexdigest(), "migration source hash changed or missing")
-            if migrate_to_v5:
+            if migrate_to_v6:
+                p.require(meta["schema"] == p.SCHEMA_V5,
+                          "v6 migration requires a v5 document; run --to-latest from older schemas")
+                full = relay_v4.expand(state, root, meta["project_id"])
+                markdown_records = relay_v4.collect_markdown(state, root, meta["project_id"])
+            elif migrate_to_v5:
                 p.require(meta["schema"] == p.SCHEMA_V4,
                           "v5 migration requires a v4 document; the v4 migration is already done")
                 full = relay_v4.expand(state, root, meta["project_id"])
@@ -2081,7 +2232,12 @@ def mutate(args, root, dry_run=False):
         elif args.command in ("update", "save", "compact", "prune"):
             p.require(meta["writer"] == args.writer and lease_active(meta), "missing, expired or conflicting lease; resume first")
             if args.command in ("update", "save"):
+                apply_patch, extension_keys = _extension_archive_keys(apply_patch, meta["schema"])
                 full = p.apply(full, apply_patch, git, targets=target_resolver)
+                if extension_keys:
+                    full, extension_records = p.archive_extensions(
+                        full, extension_keys, int(meta["revision"]) + 1,
+                        EXPLICIT_ARCHIVE_REASON)
             elif args.command == "prune":
                 p.require(set(patch) == {"prune", "project"},
                           "prune input may contain only prune and project")
@@ -2120,7 +2276,9 @@ def mutate(args, root, dry_run=False):
         auto_enabled = not getattr(args, "no_auto_compact", False)
         compacted = False
         segments = []
-        if migrate_to_v5 or meta["schema"] == p.SCHEMA_V5:
+        if migrate_to_v6 or meta["schema"] == p.SCHEMA_V6:
+            schema = p.SCHEMA_V6
+        elif migrate_to_v5 or meta["schema"] == p.SCHEMA_V5:
             schema = p.SCHEMA_V5
         elif migrate_to_v4 or meta["schema"] == p.SCHEMA_V4:
             schema = p.SCHEMA_V4
@@ -2130,10 +2288,20 @@ def mutate(args, root, dry_run=False):
             schema = p.SCHEMA
         limit, trigger, target = p.budget(schema)
         if args.command == "compact":
-            p.require(schema in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5),
+            p.require(schema in p.RECEIPT_SCHEMAS,
                       "v2 requires explicit migrate --to-v3 before compact")
         keep_lease = args.command in ("resume", "update", "prune", "compact")
         timestamp = now()
+        if migrate_to_v6:
+            full["extensions"]["migration_v6"] = {
+                "source_schema": meta["schema"],
+                "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
+                "to_schema": p.SCHEMA_V6,
+                "migrated_at": iso(timestamp),
+                "record_mapping": {"tasks": len(full["tasks"]),
+                                   "blockers": len(full["blockers"]),
+                                   "decisions": len(full["decisions"])},
+                "mapping_review_required": False}
         if migrate_to_v5:
             # Additive provenance: the v3 to v4 record in extensions.migration is
             # never rewritten, and the new step is recorded separately.
@@ -2164,26 +2332,20 @@ def mutate(args, root, dry_run=False):
                    "writer": args.writer if keep_lease else "null",
                    "lease_until": iso(timestamp + timedelta(minutes=args.lease_minutes)) if keep_lease else "null",
                    "status": full["project"]["status"], **git_fields(git)}
-        if schema in relay_v4.EXTERNAL_SCHEMAS:
-            document_state, plans, scan_texts = relay_v4.plan_full(
-                full, root, meta["project_id"], target_resolver,
-                markdown=markdown_records if schema == p.SCHEMA_V5 else None,
-                source_revision=(int(meta["revision"]) if schema == p.SCHEMA_V5 else None))
-        else:
-            document_state, plans, scan_texts = full, [], []
+        # A v5/v6 candidate is rendered from the same records that were just
+        # planned into objects, so the document can never disagree with the
+        # objects its index reference names.
+        (full, document_state, plans, scan_texts, candidate, segments, compacted, preview_size,
+         final_bytes, auto_archived, before_archive) = _plan_document(
+            full, root, meta, schema, lines, body, updates, targets=target_resolver,
+            markdown=markdown_records, source_revision=int(meta["revision"]),
+            force=(args.command == "compact" or migrate_to_v4 or migrate_to_v3
+                   or migrate_to_v5 or migrate_to_v6),
+            automatic=auto_enabled, archive=extension_records)
         # Every new persistence path is secret scanned before anything is
         # published: object payloads, index nodes and manifests.
         for scan_text in scan_texts:
             scan(scan_text, enforce_limit=False)
-        # A v5 candidate is rendered from the same records that were just planned
-        # into objects, so the document can never disagree with the objects its
-        # index reference names.
-        document_state, candidate, segments, compacted, preview_size, final_bytes = _plan_candidate(
-            lines, body, document_state, updates, meta["project_id"],
-            force=(args.command == "compact" or migrate_to_v4 or migrate_to_v3
-                   or migrate_to_v5),
-            automatic=auto_enabled,
-            markdown=markdown_records if schema == p.SCHEMA_V5 else None)
         if final_bytes > limit:
             if schema in relay_v4.EXTERNAL_SCHEMAS:
                 raise RelayError(RELAY_CURRENT_CAPACITY_EXCEEDED,
@@ -2194,8 +2356,15 @@ def mutate(args, root, dry_run=False):
                       f"excess={final_bytes - p.MAX_BYTES}; {hint}; no content was truncated")
         new = checked(candidate)
         planned_object_bytes = obs.plan_bytes(plans)
+        archive_report = ({"archived": len(auto_archived) + len(extension_records),
+                           "automatic": len(auto_archived),
+                           "explicit": len(extension_records),
+                           "before_bytes": before_archive,
+                           "count": document_state["archive"]["count"]}
+                          if schema in p.ARCHIVE_SCHEMAS else None)
         if dry_run:
             return {"dry_run": True, "estimate_only": False, "would_fit": True,
+                    "archive": archive_report,
                     "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
                     "revision": int(meta["revision"]), "candidate_revision": revision,
                     "candidate_bytes": final_bytes, "ungoverned_candidate_bytes": preview_size,
@@ -2264,6 +2433,8 @@ def mutate(args, root, dry_run=False):
         except (RelayError, p.Invalid, fs.Error, OSError, ValueError, KeyError, TypeError) as exc:
             next_cycle = {"status": "not_computed",
                           "reason": exc.code if isinstance(exc, RelayError) else "model unavailable"}
+        if archive_report is not None:
+            result["archive"] = archive_report
         result["capacity"] = _capacity_receipt(
             schema, before_bytes, final_bytes, committed=True,
             object_store_new_bytes=published["bytes_written"],
@@ -2277,12 +2448,14 @@ def parser():
     sub = result.add_subparsers(dest="command", required=True)
     for command in ("init", "status", "validate", "resume", "update", "save", "prune", "compact",
                     "migrate", "recover", "export", "verify", "capacity", "coverage", "handoff",
-                    "markdown"):
+                    "markdown", "archive"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--root", default=".")
         if command == "init":
             cmd.add_argument("--project-id")
             cmd.add_argument("--name")
+            cmd.add_argument("--schema", choices=sorted(INIT_SCHEMAS), default="v6",
+                             help="v6 (default) starts on the latest schema; v2 keeps the legacy inline format")
         if command in ("resume", "update", "save", "prune", "compact", "migrate", "recover"):
             required = command not in ("migrate", "compact")
             cmd.add_argument("--writer", required=required)
@@ -2306,6 +2479,10 @@ def parser():
             cmd.add_argument("--to-v4", action="store_true", help="explicitly externalize evidence into the v4 object store")
             cmd.add_argument("--to-v5", action="store_true",
                              help="externalize custom Markdown and the acceptance map into the v5 object store")
+            cmd.add_argument("--to-v6", action="store_true",
+                             help="add the v6 cold archive to a v5 document")
+            cmd.add_argument("--to-latest", action="store_true",
+                             help="run every remaining migration step in order, each as its own commit")
             cmd.add_argument("--source-sha256")
         if command == "capacity":
             cmd.add_argument("--writer")
@@ -2359,6 +2536,235 @@ def parser():
         if command == "markdown":
             cmd.add_argument("--section", default=None,
                              help="print one external Markdown section by its stable id")
+        if command == "archive":
+            cmd.add_argument("--id", default=None,
+                             help="print archived records by archive id or original record id")
+            cmd.add_argument("--limit", type=int, default=50)
+            cmd.add_argument("--offset", type=int, default=0)
+    return result
+
+
+MIGRATION_STEP_FLAGS = ("to_v3", "to_v4", "to_v5", "to_v6")
+# The next explicit step from each schema; v1 converts with the flagless migrate.
+NEXT_MIGRATION = {"project-continuity/v1": None, p.SCHEMA_V2: "to_v4", p.SCHEMA_V3: "to_v4",
+                  p.SCHEMA_V4: "to_v5", p.SCHEMA_V5: "to_v6"}
+MIGRATION_TARGET = {None: p.SCHEMA_V2, "to_v4": p.SCHEMA_V4, "to_v5": p.SCHEMA_V5,
+                    "to_v6": p.SCHEMA_V6}
+
+
+def _migration_chain(schema):
+    chain = []
+    while schema in NEXT_MIGRATION:
+        step = NEXT_MIGRATION[schema]
+        chain.append({"from_schema": schema, "to_schema": MIGRATION_TARGET[step],
+                      "flag": "--" + step.replace("_", "-") if step else None})
+        schema = MIGRATION_TARGET[step]
+    return chain
+
+
+def _step_args(args, step, **overrides):
+    step_args = argparse.Namespace(**vars(args))
+    step_args.to_latest = False
+    for flag in MIGRATION_STEP_FLAGS:
+        setattr(step_args, flag, flag == step)
+    for key, value in overrides.items():
+        setattr(step_args, key, value)
+    return step_args
+
+
+def migrate_latest(args, root):
+    """Run every remaining migration step in order, each as its own commit.
+
+    Every step is the same explicit, verified migration a caller could run by
+    hand.  --source-sha256 and --expected-revision bind the first step to the
+    document the caller previewed; later steps bind to the document the previous
+    step just committed.  A failure leaves the last committed (valid) schema.
+    """
+    p.require(not any(getattr(args, flag, False) for flag in MIGRATION_STEP_FLAGS),
+              "--to-latest replaces the per-step migration flags")
+    old, _lines, _body, meta, _state, _ = read_envelope(root)
+    chain = _migration_chain(meta["schema"])
+    if not args.apply:
+        if not chain:
+            return {"migration_required": False, "schema": meta["schema"],
+                    "revision": int(meta["revision"])}
+        first = dispatch(_step_args(args, NEXT_MIGRATION[meta["schema"]]), root)
+        return {"dry_run": True, "steps": chain, "first_step": first,
+                "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
+                "revision": int(meta["revision"]),
+                "note": "only the first step is previewed exactly; each later step is "
+                        "verified again when it runs"}
+    p.require(args.operation_id is not None, "operation id required")
+    steps = []
+    while True:
+        old, _lines, _body, meta, _state, _ = read_envelope(root)
+        if meta["schema"] not in NEXT_MIGRATION:
+            break
+        step = NEXT_MIGRATION[meta["schema"]]
+        overrides = {"operation_id": args.operation_id + "." + (step or "to_v2")}
+        if steps:
+            overrides["source_sha256"] = hashlib.sha256(old.encode("utf-8")).hexdigest()
+            overrides["expected_revision"] = int(meta["revision"])
+        result = mutate(_step_args(args, step, **overrides), root)
+        steps.append({"from_schema": meta["schema"], "to_schema": result.get("schema"),
+                      "revision": result.get("revision"), "replayed": result.get("replayed"),
+                      "archive": result.get("archive"),
+                      "capacity": result.get("capacity")})
+        if result.get("replayed"):
+            break
+    final = read_envelope(root)[3]
+    return {"migrated": bool(steps), "steps": steps, "schema": final["schema"],
+            "revision": int(final["revision"])}
+
+
+def dispatch(args, root):
+    if args.command == "init":
+        result = initialize(args, root)
+    elif args.command == "export":
+        result = export_bundle(args, root)
+    elif args.command == "verify":
+        result = verify_bundle(args, root)
+    elif args.command in ("status", "validate"):
+        result = status(args, root)
+    elif args.command == "capacity":
+        result = capacity_view(args, root)
+    elif args.command == "coverage":
+        result = coverage_view(args, root)
+    elif args.command == "handoff":
+        result = handoff_view(args, root)
+    elif args.command == "markdown":
+        result = markdown_view(args, root)
+    elif args.command == "archive":
+        result = archive_view(args, root)
+    elif args.command == "migrate" and getattr(args, "to_latest", False):
+        result = migrate_latest(args, root)
+    elif args.command in ("compact", "migrate", "prune") and not args.apply and all(
+            value is not None for value in (args.writer, args.expected_revision, args.operation_id)):
+        result = mutate(args, root, dry_run=True)
+    elif args.command == "compact" and not args.apply:
+        old, lines, body, meta, stub, matches = read_envelope(root)
+        p.require(stub is not None, "v1 is read-only; run migrate preview and explicit --apply")
+        p.require(matches, "derived view conflict; review direct edits before compacting")
+        archive = _archive_info(root, stub, meta)
+        p.require(archive["integrity"] != "invalid", "receipt archive integrity check failed")
+        schema = (meta["schema"] if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS
+                  else p.SCHEMA_V3)
+        limit, _trigger, target = p.budget(schema)
+        candidate_state, candidate, segments, would_compact, _, projected = _plan_candidate(
+            lines, body, stub, {"schema": schema}, meta["project_id"], force=True)
+        result = {"dry_run": True, "schema": meta["schema"], "target_schema": schema,
+                  "revision": int(meta["revision"]), "before_bytes": len(old.encode()),
+                  "candidate_bytes": projected, "would_compact": would_compact,
+                  "archived_segments": len(segments), "retained_receipts": len(candidate_state["operations"]),
+                  "target_bytes": target,
+                  "target_reached": projected <= target,
+                  "estimate_only": True, "excludes_new_operation_metadata": True,
+                  "would_fit": projected <= limit, "archive_integrity": archive["integrity"]}
+    elif args.command == "migrate" and not args.apply:
+        old, lines, body, meta, state, _ = read_envelope(root)
+        if getattr(args, "to_v6", False):
+            if meta["schema"] == p.SCHEMA_V6:
+                result = {"migration_required": False, "schema": p.SCHEMA_V6,
+                          "revision": int(meta["revision"])}
+            else:
+                p.require(meta["schema"] == p.SCHEMA_V5,
+                          "v6 migration requires a v5 document; use --to-latest")
+                source = relay_v4.expand(state, root, meta["project_id"])
+                records = relay_v4.collect_markdown(state, root, meta["project_id"])
+                resolver = relay_v4.make_target_resolver(root, meta["project_id"], state)
+                revision = int(meta["revision"]) + 1
+                (_full, _doc, plans, _texts, candidate, planned_segments, _wc, _ung, projected,
+                 moved, _before) = _plan_document(
+                    source, root, meta, p.SCHEMA_V6, lines, body,
+                    {"schema": p.SCHEMA_V6, "revision": str(revision)},
+                    targets=resolver, markdown=records, force=True)
+                checked(candidate)
+                result = {"dry_run": True,
+                          "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
+                          "from_schema": meta["schema"], "to_schema": p.SCHEMA_V6,
+                          "revision": int(meta["revision"]),
+                          "candidate_bytes": projected, "estimate_only": True,
+                          "excludes_new_operation_metadata": True,
+                          "planned_segments": len(planned_segments),
+                          "archive": {"automatic": len(moved)},
+                          "objects": {"planned": len(plans),
+                                      "unique_new_bytes": obs.plan_bytes(plans)},
+                          "mapping_review_required": False}
+        elif getattr(args, "to_v5", False):
+            if meta["schema"] == p.SCHEMA_V5:
+                result = {"migration_required": False, "schema": p.SCHEMA_V5,
+                          "revision": int(meta["revision"])}
+            else:
+                p.require(meta["schema"] == p.SCHEMA_V4,
+                          "v5 migration requires a v4 document; run --to-v4 first")
+                source = relay_v4.expand(state, root, meta["project_id"])
+                records = p.split_markdown(p.custom_region(body))
+                resolver = relay_v4.make_target_resolver(root, meta["project_id"], state)
+                stub, plans, _texts = relay_v4.plan_full(
+                    source, root, meta["project_id"], resolver,
+                    markdown=records, source_revision=int(meta["revision"]))
+                _st, candidate, planned_segments, _wc, _ung, projected = _plan_candidate(
+                    lines, body, stub, {"schema": p.SCHEMA_V5}, meta["project_id"],
+                    force=True, markdown=records)
+                checked(candidate)
+                result = {"dry_run": True,
+                          "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
+                          "from_schema": meta["schema"], "to_schema": p.SCHEMA_V5,
+                          "revision": int(meta["revision"]),
+                          "candidate_bytes": projected,
+                          "planned_segments": len(planned_segments),
+                          "markdown_sections": len(records),
+                          "markdown_bytes": sum(r["bytes"] for r in records),
+                          "objects": {"planned": len(plans),
+                                      "unique_new_bytes": obs.plan_bytes(plans)},
+                          "mapping_review_required": False}
+        elif getattr(args, "to_v4", False):
+            if meta["schema"] == p.SCHEMA_V4:
+                result = {"migration_required": False, "schema": p.SCHEMA_V4,
+                          "revision": int(meta["revision"])}
+            else:
+                p.require(meta["schema"] in (p.SCHEMA_V2, p.SCHEMA_V3),
+                          "v4 migration requires a v2 or v3 document")
+                source = p.validate(copy.deepcopy(state))
+                stub, plans, _texts = relay_v4.plan_full(source, root, meta["project_id"])
+                _st, candidate, planned_segments, _wc, _ung, projected = _plan_candidate(
+                    lines, body, stub, {"schema": p.SCHEMA_V4}, meta["project_id"],
+                    force=True)
+                checked(candidate)
+                result = {"dry_run": True,
+                          "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
+                          "from_schema": meta["schema"], "to_schema": p.SCHEMA_V4,
+                          "revision": int(meta["revision"]),
+                          "candidate_bytes": projected,
+                          "planned_segments": len(planned_segments),
+                          "objects": {"planned": len(plans),
+                                      "unique_new_bytes": obs.plan_bytes(plans)},
+                          "mapping_review_required": True}
+        elif getattr(args, "to_v3", False):
+            p.require(state is not None, "v2 to v3 migration requires a v2 document")
+            if meta["schema"] == p.SCHEMA_V3:
+                result = {"migration_required": False, "schema": p.SCHEMA_V3,
+                          "revision": int(meta["revision"])}
+            else:
+                p.require(meta["schema"] == p.SCHEMA_V2, "v2 to v3 migration requires a v2 document")
+                candidate_state, _, _ = migration(old, body, meta, to_v3=True, state=state)
+                candidate_state, candidate, planned_segments, _, _, projected = _plan_candidate(
+                    lines, body, candidate_state, {"schema": p.SCHEMA_V3}, meta["project_id"], force=True)
+                checked(candidate)
+                result = {"dry_run": True, "source_sha256": hashlib.sha256(old.encode()).hexdigest(),
+                          "from_schema": meta["schema"], "to_schema": p.SCHEMA_V3,
+                          "revision": int(meta["revision"]), "candidate_bytes": len(candidate.encode()),
+                          "planned_segments": len(planned_segments), "mapping_review_required": False}
+        elif state is not None:
+            result = {"migration_required": False, "revision": int(meta["revision"]), "schema": meta["schema"]}
+        else:
+            state, body, _ = migration(old, body, meta)
+            candidate = checked(metadata(lines, {"schema": p.SCHEMA, "status": "paused"}) + body)
+            result = {"dry_run": True, "source_sha256": hashlib.sha256(old.encode()).hexdigest(),
+                      "revision": int(meta["revision"]), "candidate_bytes": len(candidate.encode()),
+                      "mapping_review_required": True}
+    else:
+        result = mutate(args, root)
     return result
 
 
@@ -2369,121 +2775,7 @@ def main(argv=None):
         # Successful writes report a history path; reject sensitive roots before
         # creating any state, rather than discovering unsafe output postcommit.
         scan(str(root))
-        if args.command == "init":
-            result = initialize(args, root)
-        elif args.command == "export":
-            result = export_bundle(args, root)
-        elif args.command == "verify":
-            result = verify_bundle(args, root)
-        elif args.command in ("status", "validate"):
-            result = status(args, root)
-        elif args.command == "capacity":
-            result = capacity_view(args, root)
-        elif args.command == "coverage":
-            result = coverage_view(args, root)
-        elif args.command == "handoff":
-            result = handoff_view(args, root)
-        elif args.command == "markdown":
-            result = markdown_view(args, root)
-        elif args.command in ("compact", "migrate", "prune") and not args.apply and all(
-                value is not None for value in (args.writer, args.expected_revision, args.operation_id)):
-            result = mutate(args, root, dry_run=True)
-        elif args.command == "compact" and not args.apply:
-            old, lines, body, meta, stub, matches = read_envelope(root)
-            p.require(stub is not None, "v1 is read-only; run migrate preview and explicit --apply")
-            p.require(matches, "derived view conflict; review direct edits before compacting")
-            archive = _archive_info(root, stub, meta)
-            p.require(archive["integrity"] != "invalid", "receipt archive integrity check failed")
-            schema = (meta["schema"] if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS
-                      else p.SCHEMA_V3)
-            limit, _trigger, target = p.budget(schema)
-            candidate_state, candidate, segments, would_compact, _, projected = _plan_candidate(
-                lines, body, stub, {"schema": schema}, meta["project_id"], force=True)
-            result = {"dry_run": True, "schema": meta["schema"], "target_schema": schema,
-                      "revision": int(meta["revision"]), "before_bytes": len(old.encode()),
-                      "candidate_bytes": projected, "would_compact": would_compact,
-                      "archived_segments": len(segments), "retained_receipts": len(candidate_state["operations"]),
-                      "target_bytes": target,
-                      "target_reached": projected <= target,
-                      "estimate_only": True, "excludes_new_operation_metadata": True,
-                      "would_fit": projected <= limit, "archive_integrity": archive["integrity"]}
-        elif args.command == "migrate" and not args.apply:
-            old, lines, body, meta, state, _ = read_envelope(root)
-            if getattr(args, "to_v5", False):
-                if meta["schema"] == p.SCHEMA_V5:
-                    result = {"migration_required": False, "schema": p.SCHEMA_V5,
-                              "revision": int(meta["revision"])}
-                else:
-                    p.require(meta["schema"] == p.SCHEMA_V4,
-                              "v5 migration requires a v4 document; run --to-v4 first")
-                    source = relay_v4.expand(state, root, meta["project_id"])
-                    records = p.split_markdown(p.custom_region(body))
-                    resolver = relay_v4.make_target_resolver(root, meta["project_id"], state)
-                    stub, plans, _texts = relay_v4.plan_full(
-                        source, root, meta["project_id"], resolver,
-                        markdown=records, source_revision=int(meta["revision"]))
-                    _st, candidate, planned_segments, _wc, _ung, projected = _plan_candidate(
-                        lines, body, stub, {"schema": p.SCHEMA_V5}, meta["project_id"],
-                        force=True, markdown=records)
-                    checked(candidate)
-                    result = {"dry_run": True,
-                              "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
-                              "from_schema": meta["schema"], "to_schema": p.SCHEMA_V5,
-                              "revision": int(meta["revision"]),
-                              "candidate_bytes": projected,
-                              "planned_segments": len(planned_segments),
-                              "markdown_sections": len(records),
-                              "markdown_bytes": sum(r["bytes"] for r in records),
-                              "objects": {"planned": len(plans),
-                                          "unique_new_bytes": obs.plan_bytes(plans)},
-                              "mapping_review_required": False}
-            elif getattr(args, "to_v4", False):
-                if meta["schema"] == p.SCHEMA_V4:
-                    result = {"migration_required": False, "schema": p.SCHEMA_V4,
-                              "revision": int(meta["revision"])}
-                else:
-                    p.require(meta["schema"] in (p.SCHEMA_V2, p.SCHEMA_V3),
-                              "v4 migration requires a v2 or v3 document")
-                    source = p.validate(copy.deepcopy(state))
-                    stub, plans, _texts = relay_v4.plan_full(source, root, meta["project_id"])
-                    _st, candidate, planned_segments, _wc, _ung, projected = _plan_candidate(
-                        lines, body, stub, {"schema": p.SCHEMA_V4}, meta["project_id"],
-                        force=True)
-                    checked(candidate)
-                    result = {"dry_run": True,
-                              "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
-                              "from_schema": meta["schema"], "to_schema": p.SCHEMA_V4,
-                              "revision": int(meta["revision"]),
-                              "candidate_bytes": projected,
-                              "planned_segments": len(planned_segments),
-                              "objects": {"planned": len(plans),
-                                          "unique_new_bytes": obs.plan_bytes(plans)},
-                              "mapping_review_required": True}
-            elif getattr(args, "to_v3", False):
-                p.require(state is not None, "v2 to v3 migration requires a v2 document")
-                if meta["schema"] == p.SCHEMA_V3:
-                    result = {"migration_required": False, "schema": p.SCHEMA_V3,
-                              "revision": int(meta["revision"])}
-                else:
-                    p.require(meta["schema"] == p.SCHEMA_V2, "v2 to v3 migration requires a v2 document")
-                    candidate_state, _, _ = migration(old, body, meta, to_v3=True, state=state)
-                    candidate_state, candidate, planned_segments, _, _, projected = _plan_candidate(
-                        lines, body, candidate_state, {"schema": p.SCHEMA_V3}, meta["project_id"], force=True)
-                    checked(candidate)
-                    result = {"dry_run": True, "source_sha256": hashlib.sha256(old.encode()).hexdigest(),
-                              "from_schema": meta["schema"], "to_schema": p.SCHEMA_V3,
-                              "revision": int(meta["revision"]), "candidate_bytes": len(candidate.encode()),
-                              "planned_segments": len(planned_segments), "mapping_review_required": False}
-            elif state is not None:
-                result = {"migration_required": False, "revision": int(meta["revision"]), "schema": meta["schema"]}
-            else:
-                state, body, _ = migration(old, body, meta)
-                candidate = checked(metadata(lines, {"schema": p.SCHEMA, "status": "paused"}) + body)
-                result = {"dry_run": True, "source_sha256": hashlib.sha256(old.encode()).hexdigest(),
-                          "revision": int(meta["revision"]), "candidate_bytes": len(candidate.encode()),
-                          "mapping_review_required": True}
-        else:
-            result = mutate(args, root)
+        result = dispatch(args, root)
         output = json.dumps(result, ensure_ascii=False)
         # CLI diagnostics may legitimately be larger than CURRENT.md (for
         # example status includes task summaries); the relay document limit

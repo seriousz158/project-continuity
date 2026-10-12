@@ -18,7 +18,7 @@ class ReliabilityTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.assertEqual(self.call('init')[0],0)
+        self.assertEqual(self.call('init', '--schema', 'v2')[0],0)
         self.assertEqual(self.call('resume','--writer','a','--expected-revision','0','--operation-id','r')[0],0)
         self.current = self.root/'.relay/CURRENT.md'
 

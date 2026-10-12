@@ -47,7 +47,7 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 return json.loads(result.stdout)
 
-            run("init", "--root", project)
+            run("init", "--schema", "v2", "--root", project)
             self.assertEqual(run("status", "--root", project)["revision"], 0)
             run("resume", "--root", project, "--writer", "package-test",
                 "--expected-revision", "0", "--operation-id", "resume-1")

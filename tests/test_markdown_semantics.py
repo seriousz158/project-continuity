@@ -41,7 +41,7 @@ class MarkdownSemanticsCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.assertEqual(self.call("init", "--name", "md fixture")[0], 0)
+        self.assertEqual(self.call("init", "--schema", "v2", "--name", "md fixture")[0], 0)
         self.seed_v5()
 
     def call(self, *args, patch=None, expect=0):

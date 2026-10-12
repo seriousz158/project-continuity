@@ -30,7 +30,8 @@ import storage as fs
 import v4 as relay_v4
 
 COLLECTIONS = ("tasks", "blockers", "evidence", "decisions", "corrections")
-MANAGED_EXTENSIONS = ("compaction", "migration", "ac_map")
+MANAGED_EXTENSIONS = ("compaction", "migration", "migration_v5", "migration_v6", "ac_map",
+                      "external_markdown")
 
 
 def _document_parts(text):
@@ -40,15 +41,29 @@ def _document_parts(text):
 
 
 def logical_state(text, root=None):
-    """Complete logical state of a relay document (v2/v3 inline or v4 resolved)."""
+    """Complete logical state: v2/v3 inline, v4/v5 resolved, v6 resolved plus archive.
+
+    A v6 archive is cold history of the same logical state, so archived records
+    are folded back into their collections (and archived extension namespaces
+    into extensions) before anything is compared.
+    """
     body, meta = _document_parts(text)
     schema = meta["schema"]
     if schema == "project-continuity/v1":
         raise ValueError("v1 has no structured state")
-    if schema == p.SCHEMA_V4:
+    if schema in relay_v4.EXTERNAL_SCHEMAS:
         if root is None:
-            raise ValueError("a v4 document needs an explicit project root")
-        return relay_v4.resolve(text, root), meta
+            raise ValueError("an external document needs an explicit project root")
+        state = relay_v4.resolve(text, root)
+        if schema in p.ARCHIVE_SCHEMAS:
+            _meta, stub, _matches = relay_v4.envelope_state(text)
+            for record in relay_v4.collect_archive(stub, root, meta["project_id"]):
+                if record["collection"] == "extensions":
+                    state["extensions"][record["record"]["key"]] = record["record"]["value"]
+                else:
+                    state.setdefault(record["collection"], []).append(record["record"])
+            state.pop("archive", None)
+        return state, meta
     state, _matches = p.parse_body(body)
     return state, meta
 
@@ -128,7 +143,7 @@ def _operation_report(before_state, after_state, before_meta, after_meta, root):
     left = inline(before_state)
     right = inline(after_state)
     archived = {}
-    if after_meta["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4) and root is not None:
+    if after_meta["schema"] in p.RECEIPT_SCHEMAS and root is not None:
         import cli_v2
         try:
             for record in cli_v2._archive_chain(root, after_state, after_meta):

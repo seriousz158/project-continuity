@@ -141,8 +141,38 @@ def expand(stub, project_root, project_id, budget=None):
                     RELAY_MARKDOWN_DIGEST_MISMATCH,
                     "the externalised Markdown does not match the document digest")
         full.pop("markdown", None)
+    if "archive" in stub:
+        # Only the index is read here: the reference binds every archived
+        # object by digest, and the deep check reads the objects themselves.
+        archive_entries(root, project_id, stub["archive"], budget)
     p.validate(full, make_target_resolver(root, project_id, stub, budget))
     return full
+
+
+def archive_entries(root, project_id, ref, budget):
+    """Index entries of the cold archive, bound to the document's reference.
+
+    The archive reference digests its index entries (each carries the digest of
+    one archived object) rather than the records, so appending to a long archive
+    reads index nodes, never every archived object.
+    """
+    p._require_index_ref(ref, "archive")
+    entries = obs.read_index(root, project_id, "archive", ref["index"], budget)
+    if len(entries) != ref["count"]:
+        raise RelayError(RELAY_INDEX_INVALID, "archive index count disagrees with the document")
+    if p.digest(entries) != ref["sha256"]:
+        raise RelayError(RELAY_INDEX_INVALID, "archive index content disagrees with the document")
+    return entries
+
+
+def collect_archive(stub, project_root, project_id, budget=None):
+    """Every archived record, read and verified object by object."""
+    _require(isinstance(stub, dict) and isinstance(stub.get("archive"), dict),
+             "this document has no archive")
+    root = fs.root_path(project_root)
+    budget = budget if budget is not None else obs.Budget()
+    entries = archive_entries(root, project_id, stub["archive"], budget)
+    return [obs.read_object(root, project_id, "archive", entry, budget) for entry in entries]
 
 
 def collect_markdown(stub, project_root, project_id, budget=None):
@@ -163,7 +193,7 @@ def resolve_markdown(document_text, project_root=None):
     v4 and earlier it is the unmanaged region of the document itself.
     """
     meta, body = parse_envelope(document_text)
-    if meta["schema"] != p.SCHEMA_V5:
+    if meta["schema"] not in p.MARKDOWN_SCHEMAS:
         return p.custom_region(body)
     if project_root is None:
         raise RelayError(RELAY_SCHEMA_V4_REQUIRES_RESOLVER,
@@ -190,9 +220,9 @@ def _collect_ref(root, project_id, record_type, ref, budget):
 # Schemas whose committed state depends on the external object store.  Every
 # document in one of these schemas is deep-checked; every other schema reports
 # the check as not applicable rather than as a pass.
-EXTERNAL_SCHEMAS = tuple(s for s in (p.SCHEMA_V4, getattr(p, "SCHEMA_V5", None)) if s)
+EXTERNAL_SCHEMAS = p.EXTERNAL_SCHEMAS
 
-OBJECT_CHECK_SCOPE = "every reachable evidence, correction and markdown object"
+OBJECT_CHECK_SCOPE = "every reachable evidence, correction, markdown and archive object"
 OBJECT_CHECK_LIMITS = ("external_references", "seal_bytes", "test_suites",
                        "provider_calls", "network")
 
@@ -226,6 +256,8 @@ def object_integrity(root, project_id, stub, schema, budget=None):
               "scope": OBJECT_CHECK_SCOPE, "does_not_cover": list(OBJECT_CHECK_LIMITS)}
     try:
         expand(stub, root, project_id, budget)
+        if "archive" in stub:
+            collect_archive(stub, root, project_id, budget)
         reachable_manifest_digests(root, project_id, stub, budget)
         declared = stub.get("extensions", {})
         declared = declared.get("ac_map") if isinstance(declared, dict) else None
@@ -246,7 +278,8 @@ def object_integrity(root, project_id, stub, schema, budget=None):
                 count=stub["evidence"].get("count"))
 
 
-def plan_full(state, root, project_id, targets=None, markdown=None, source_revision=None):
+def plan_full(state, root, project_id, targets=None, markdown=None, source_revision=None,
+              archive=None):
     """Return (stub_state, publish_plans); never touches the filesystem.
 
     Passing the custom Markdown records selects the v5 representation: the text
@@ -327,6 +360,21 @@ def plan_full(state, root, project_id, targets=None, markdown=None, source_revis
         provenance["bytes"] = sum(record["bytes"] for record in markdown)
         provenance["text_sha256"] = p.markdown_text_digest(markdown)
         stub["extensions"]["external_markdown"] = provenance
+    if archive is not None:
+        # Append-only: earlier entries are reused as they are, and the fixed
+        # leaf size means only the last leaf and its ancestors are rewritten.
+        previous = stub.get("archive") or p.index_ref(None, 0, p.digest([]))
+        entries = list(archive_entries(root, project_id, previous, obs.Budget()))
+        for record in archive:
+            entry, part = obs.entry_for(root, project_id, "archive", record)
+            entries.append(entry)
+            plans.extend(part)
+            texts.append(obs.envelope_text(project_id, "archive", record))
+        archive_plans, archive_sha = obs.plan_index(root, project_id, "archive", entries)
+        plans.extend(archive_plans)
+        for plan in archive_plans:
+            texts.append(plan["content"].decode("utf-8"))
+        stub["archive"] = p.index_ref(archive_sha, len(entries), p.digest(entries))
     p.validate(stub)
     return stub, plans, texts
 
