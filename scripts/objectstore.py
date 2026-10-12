@@ -63,6 +63,9 @@ RECORD_FORMATS = {
 RECORD_TYPES = tuple(sorted(RECORD_FORMATS))
 OBJECT_MAX_BYTES = 262144
 MAX_INDEX_ENTRIES = 512
+# Writers fill leaves of this size so an append rewrites one small leaf plus
+# its ancestors; readers still accept the v0.4 leaves of up to 512 entries.
+INDEX_LEAF_WRITE_ENTRIES = 16
 MAX_INDEX_DEPTH = 3
 MAX_OBJECTS = 200000
 MAX_LOGICAL_BYTES = 64 * 1024 * 1024
@@ -224,14 +227,15 @@ def plan_index(root: Path, project_id: str, record_type: str, entries: list) -> 
                       "content": data, "sha256": sha})
         return sha
 
-    levels = 1
-    while len(entries) > MAX_INDEX_ENTRIES ** levels:
+    levels, capacity = 1, INDEX_LEAF_WRITE_ENTRIES
+    while len(entries) > capacity:
         levels += 1
+        capacity *= MAX_INDEX_ENTRIES
         if levels > MAX_INDEX_DEPTH:
             raise RelayError(RELAY_OBJECT_LIMIT_EXCEEDED, "index depth exceeded")
     nodes = []
-    for offset in range(0, len(entries), MAX_INDEX_ENTRIES):
-        group = entries[offset:offset + MAX_INDEX_ENTRIES]
+    for offset in range(0, len(entries), INDEX_LEAF_WRITE_ENTRIES):
+        group = entries[offset:offset + INDEX_LEAF_WRITE_ENTRIES]
         node = {"schema": INDEX_SCHEMA, "project_id": project_id,
                 "record_type": record_type, "kind": "leaf", "count": len(group),
                 "entries": group}

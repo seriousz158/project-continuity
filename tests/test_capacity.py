@@ -122,6 +122,32 @@ class CapacityTests(unittest.TestCase):
         self.assertFalse(result[1]["compaction"]["applied"])
         self.assertEqual(len(list((self.root / ".relay/receipts").iterdir())), count)
 
+    def test_above_trigger_small_receipt_surplus_does_not_thrash(self):
+        # A document held above the trigger by business data, not receipts,
+        # must not spill one receipt into a new segment on every write.
+        self.make_archived()
+        document = (self.root / ".relay/CURRENT.md").read_text(encoding="utf-8")
+        _limit, trigger, _target = cli.p.budget(cli.p.SCHEMA_V3)
+        padding = "\n" + "x" * (trigger - len(document.encode()) + 512) + "\n"
+        (self.root / ".relay/CURRENT.md").write_text(document + padding, encoding="utf-8")
+        segments = lambda: len(list((self.root / ".relay/receipts").iterdir()))
+        before = segments()
+        self.assertEqual(self.call("resume", "--writer", "a", "--expected-revision", "38",
+                                   "--operation-id", "pad-resume")[0], 0)
+        for revision in range(39, 49):
+            result = self.call("update", "--writer", "a", "--expected-revision", str(revision),
+                               "--operation-id", f"pad-{revision}")
+            self.assertEqual(result[0], 0, result[2])
+        self.assertEqual(segments(), before)
+        # Once the surplus reaches a full batch the receipts move in one segment.
+        for revision in range(49, 56):
+            result = self.call("update", "--writer", "a", "--expected-revision", str(revision),
+                               "--operation-id", f"pad-{revision}")
+            self.assertEqual(result[0], 0, result[2])
+        self.assertEqual(segments(), before + 1)
+        self.assertLess(self.call("status")[1]["current_receipts"],
+                        cli.p.RECEIPT_KEEP + cli.p.RECEIPT_SEGMENT_MIN)
+
     def test_near_limit_v2_migrates_then_hands_off_losslessly(self):
         # Synthetic fixture only: no activity or business data is copied.
         old, lines, body, meta, state, _ = cli.read(self.root)

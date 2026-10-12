@@ -41,10 +41,19 @@ PUBLISH_WAIT_SLICE = 0.002
 PUBLISH_WAIT_ATTEMPTS = 3
 
 
-def _validate(info, directory=False):
+def _link_refusal(path=None):
+    # The path is the caller's own local path; naming it is what lets the
+    # caller fix the call (for example a macOS /tmp that is itself a symlink).
+    if path is None:
+        return Error("symlink or reparse point is not allowed")
+    return Error(f"symlink or reparse point is not allowed: {path}"
+                 " (resolve the path, or pass trusted input with --input -)")
+
+
+def _validate(info, directory=False, path=None):
     reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & reparse:
-        raise Error("symlink or reparse point is not allowed")
+        raise _link_refusal(path)
     if directory:
         if not stat.S_ISDIR(info.st_mode):
             raise Error("ancestor is not a directory")
@@ -70,7 +79,7 @@ def _final_info(path: Path, missing=False):
     path = _absolute(path)
     cursor = Path(path.anchor)
     info = cursor.lstat()
-    _validate(info, directory=True)
+    _validate(info, directory=True, path=cursor)
     parts = path.parts[1:]
     for index, part in enumerate(parts):
         cursor /= part
@@ -82,7 +91,7 @@ def _final_info(path: Path, missing=False):
                 return None
             raise
         if not last:
-            _validate(info, directory=True)
+            _validate(info, directory=True, path=cursor)
     return info
 
 
@@ -93,7 +102,7 @@ def _ls_final(path: Path, missing=False):
         return None
     reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & reparse:
-        raise Error("symlink or reparse point is not allowed")
+        raise _link_refusal(path)
     if not stat.S_ISREG(info.st_mode):
         raise Error("expected a regular file")
     return info
@@ -235,7 +244,7 @@ def _check(path: Path, *, missing=False):
     info = _final_info(path, missing=missing)
     if info is None:
         return None
-    _validate(info, directory=False)
+    _validate(info, directory=False, path=path)
     return info
 
 

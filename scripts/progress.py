@@ -72,6 +72,9 @@ KIND_STATE = {"revocation": CURRENT_REVOKED, "supersession": CURRENT_SUPERSEDED,
 
 RECEIPT_KEEP = 32
 RECEIPT_SEGMENT_MAX = 128
+# Automatic compaction waits for a full batch so a document held above the
+# trigger by business data does not spill one receipt per write.
+RECEIPT_SEGMENT_MIN = 16
 DATA_START = "<!-- project-continuity:data -->\n```json\n"
 DATA_END = "\n```\n<!-- project-continuity:/data -->"
 VIEW_START = "<!-- project-continuity:view -->\n"
@@ -86,6 +89,31 @@ class Invalid(ValueError):
 def require(condition, message):
     if not condition:
         raise Invalid(message)
+
+
+def require_fields(record, allowed, label, required=None, managed=()):
+    """Exact or subset key check whose message names schema fields, never input values.
+
+    Missing fields are named because they come from the schema.  Unexpected
+    keys come from the input, so only their number is reported.
+    """
+    keys = set(record)
+    missing = sorted((set(allowed) if required is None else set(required)) - keys)
+    unexpected = len(keys - set(allowed))
+    if not missing and not unexpected:
+        return
+    parts = []
+    if missing:
+        parts.append("missing [" + ", ".join(missing) + "]")
+    if unexpected:
+        parts.append(f"unexpected {unexpected} field(s)")
+    parts.append("allowed [" + ", ".join(sorted(set(allowed) - set(managed))) + "]")
+    raise Invalid(f"invalid {label} fields: " + "; ".join(parts))
+
+
+def meta_value(value):
+    """Front matter stores an absent value as the text ``null``; readers get JSON null."""
+    return None if value == "null" else value
 
 
 def loads(text):
@@ -798,10 +826,10 @@ def validate(state, targets=None):
     for optional in ("corrections", "ac_map", "markdown"):
         if optional in state:
             allowed = allowed | {optional}
-    require(set(state) == allowed, "invalid state fields")
+    require_fields(state, allowed, "state")
     project = state["project"]
     require(isinstance(project, dict), "project must be an object")
-    require(set(project) == {"name", "goal", "status", "current_task", "next_step", "outcomes"}, "invalid project fields")
+    require_fields(project, {"name", "goal", "status", "current_task", "next_step", "outcomes"}, "project")
     text(project["name"], "project name")
     for key in ("goal", "next_step"):
         text(project[key], key, empty=True)
@@ -853,7 +881,7 @@ def validate(state, targets=None):
         _require_index_ref(state["markdown"], "markdown")
     require(project["current_task"] is None or project["current_task"] in tasks, "current task missing")
     for task in tasks.values():
-        require(set(task) <= {"id", "title", "status", "owner", "depends_on", "acceptance", "reason", "generation"}, "invalid task fields")
+        require_fields(task, {"id", "title", "status", "owner", "depends_on", "acceptance", "reason", "generation"}, "task", required=(), managed=("generation",))
         text(task.get("title"), "title")
         require(task.get("status") in ("todo", "doing", "blocked", "done", "cancelled"), "invalid task status")
         require(task.get("owner") is None or isinstance(task["owner"], str), "invalid owner")
@@ -881,7 +909,7 @@ def validate(state, targets=None):
     for key in tasks:
         visit(key)
     for blocker in blockers.values():
-        require(set(blocker) <= {"id", "task_id", "description", "status", "resolution"}, "invalid blocker fields")
+        require_fields(blocker, {"id", "task_id", "description", "status", "resolution"}, "blocker", required=())
         require(blocker.get("task_id") in tasks, "blocker task missing")
         text(blocker.get("description"), "blocker description")
         require(blocker.get("status") in ("open", "resolved"), "invalid blocker status")
@@ -897,7 +925,7 @@ def validate(state, targets=None):
     for blocker_id in scopes:
         require(blocker_id in blockers, "blocker scope names an unknown blocker")
     for item in evidence.values():
-        require(set(item) == {"id", "task_id", "check", "result", "at", "ref", "baseline", "acceptance", "generation"}, "invalid evidence fields")
+        require_fields(item, {"id", "task_id", "check", "result", "at", "ref", "baseline", "acceptance", "generation"}, "evidence", managed=("baseline", "generation"))
         require(item["task_id"] in tasks, "evidence task missing")
         for key in ("check", "ref"):
             text(item[key], "evidence " + key)
@@ -918,7 +946,7 @@ def validate(state, targets=None):
             covered = {a for e in live.values() if e["task_id"] == task["id"] and e["result"] == "pass" and e["generation"] == task["generation"] for a in e["acceptance"]}
             require(set(task["acceptance"]) <= covered, "done task needs evidence for every acceptance")
     for decision in decisions.values():
-        require(set(decision) == {"id", "task_ids", "conclusion", "reason"}, "invalid decision fields")
+        require_fields(decision, {"id", "task_ids", "conclusion", "reason"}, "decision")
         require(isinstance(decision["task_ids"], list) and all(isinstance(t, str) and t in tasks for t in decision["task_ids"]), "decision task missing")
         text(decision["conclusion"], "decision conclusion")
         text(decision["reason"], "decision reason")
@@ -1002,9 +1030,8 @@ def prune(state, spec, expected_revision=None):
     writer rebuilds only the reachable indexes after this logical change.
     """
     require(isinstance(spec, dict), "prune change must be an object")
-    require(set(spec) == {"task_ids", "blocker_ids", "evidence_ids",
-                          "decision_ids", "reason", "target_revision"},
-            "invalid prune manifest fields")
+    require_fields(spec, {"task_ids", "blocker_ids", "evidence_ids",
+                          "decision_ids", "reason", "target_revision"}, "prune manifest")
     for key in ("task_ids", "blocker_ids", "evidence_ids", "decision_ids"):
         values = spec[key]
         require(isinstance(values, list), "prune ids must be lists")

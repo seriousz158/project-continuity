@@ -12,6 +12,12 @@ python scripts/write_current.py update --root <project> \
   --input examples/change.json
 ```
 
+`evidence.json` follows it: one passing evidence record that covers the
+acceptance condition, plus the task marked `done` in the same change. Evidence
+takes exactly `id`, `task_id`, `check`, `result` (`pass`, `fail` or `not_run`),
+`at` (a timestamp with a timezone), `ref` and `acceptance`; the CLI records the
+Git baseline and the task generation itself.
+
 Before writing, preview the exact patch without touching anything:
 
 ```bash

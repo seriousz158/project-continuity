@@ -1,0 +1,150 @@
+"""v0.5.0 regressions: packaging, null metadata, error context and growth model."""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / 'scripts/write_current.py'
+sys.path.insert(0, str(ROOT / 'scripts'))
+import package_skill  # noqa: E402
+
+
+def run(root, *args, patch=None, input_path=None):
+    command = [sys.executable, str(SCRIPT), *args, '--root', str(root)]
+    if input_path is not None:
+        command += ['--input', str(input_path)]
+    return subprocess.run(command, input=json.dumps(patch) if patch is not None else None,
+                          text=True, encoding='utf-8', capture_output=True, timeout=60)
+
+
+class V05FixTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+
+    def call(self, *args, patch=None, ok=True, input_path=None):
+        result = run(self.root, *args, patch=patch, input_path=input_path)
+        if ok:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        return result
+
+    def leased(self, revision, op):
+        self.call('resume', '--writer', 'agent:a', '--expected-revision', str(revision),
+                  '--operation-id', op)
+
+    def test_every_test_module_is_packaged(self):
+        on_disk = {f"tests/{path.name}" for path in (ROOT / 'tests').glob('test_*.py')}
+        self.assertEqual(on_disk - set(package_skill.FILES), set())
+
+    def test_null_metadata_is_reported_as_json_null(self):
+        self.call('init')
+        status = self.call('status')
+        self.assertIsNone(status['writer'])
+        self.assertIsNone(status['lease_until'])
+        handoff = self.call('handoff')
+        self.assertIsNone(handoff['source_identity']['writer'])
+        self.assertIsNone(handoff['source_identity']['lease_until'])
+
+    def test_field_errors_name_missing_fields_without_values(self):
+        self.call('init')
+        self.leased(0, 'op1')
+        patch = {'tasks': [{'id': 't1', 'title': 'x', 'acceptance': ['works']}],
+                 'evidence': [{'id': 'e1', 'task_id': 't1', 'check': 'secret-check-text',
+                               'result': 'pass', 'summary': 'secret-summary-value',
+                               'acceptance': ['works']}]}
+        result = self.call('update', '--writer', 'agent:a', '--expected-revision', '1',
+                           '--operation-id', 'op2', '--input', '-', patch=patch, ok=False)
+        error = json.loads(result.stdout or result.stderr)['error']
+        self.assertIn('missing [at, ref]', error)
+        self.assertIn('unexpected 1 field', error)
+        self.assertNotIn('secret', error)
+        self.assertNotIn('summary', error)
+
+    def test_symlink_error_names_the_offending_path(self):
+        self.call('init')
+        self.leased(0, 'op1')
+        real = self.root / 'real'
+        real.mkdir()
+        (real / 'change.json').write_text('{}', encoding='utf-8')
+        link = self.root / 'linked'
+        os.symlink(real, link)
+        result = self.call('update', '--writer', 'agent:a', '--expected-revision', '1',
+                           '--operation-id', 'op2', input_path=link / 'change.json', ok=False)
+        error = json.loads(result.stdout or result.stderr)['error']
+        self.assertIn(str(link), error)
+        self.assertIn('--input -', error)
+
+    def test_examples_complete_a_task(self):
+        self.call('init')
+        self.leased(0, 'op1')
+        self.call('update', '--writer', 'agent:a', '--expected-revision', '1',
+                  '--operation-id', 'op2', input_path=ROOT / 'examples/change.json')
+        self.call('save', '--writer', 'agent:a', '--expected-revision', '2',
+                  '--operation-id', 'op3', input_path=ROOT / 'examples/evidence.json')
+        tasks = self.call('handoff')['tasks']
+        self.assertEqual([task['status'] for task in tasks], ['done'])
+
+    def test_growth_model_works_when_the_first_task_is_done(self):
+        self.call('init')
+        self.leased(0, 'op1')
+        patch = {'tasks': [{'id': 'done-task', 'title': 'x', 'status': 'done',
+                            'acceptance': ['works']},
+                           {'id': 'open-task', 'title': 'y', 'acceptance': ['later']}],
+                 'evidence': [{'id': 'e1', 'task_id': 'done-task', 'check': 'unit',
+                               'result': 'pass', 'at': '2026-10-11T00:00:00Z',
+                               'ref': 'tests/test_x.py', 'acceptance': ['works']}]}
+        self.call('save', '--writer', 'agent:a', '--expected-revision', '1',
+                  '--operation-id', 'op2', '--input', '-', patch=patch)
+        growth = self.call('capacity')['growth']
+        self.assertNotIn('error', growth)
+        self.assertEqual(growth['model']['status'], 'modelled')
+        self.assertGreater(growth['evidence']['current_bytes'], 0)
+
+
+class IndexFanoutTests(unittest.TestCase):
+    def entries(self, root, count):
+        import objectstore as obs
+        return [obs.entry_for(root, 'p1', 'evidence',
+                              {'id': f'ev-{i:04d}', 'task_id': 't1', 'check': 'c',
+                               'result': 'pass', 'at': '2026-10-11T00:00:00Z', 'ref': 'r',
+                               'baseline': {}, 'acceptance': [], 'generation': 0})[0]
+                for i in range(count)]
+
+    def test_appending_one_record_rewrites_a_bounded_index(self):
+        import objectstore as obs
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            existing = self.entries(root, 101)
+            before, _ = obs.plan_index(root, 'p1', 'evidence', existing[:100])
+            after, _ = obs.plan_index(root, 'p1', 'evidence', existing)
+            known = {plan['sha256'] for plan in before}
+            new_bytes = sum(len(plan['content']) for plan in after if plan['sha256'] not in known)
+            self.assertLess(new_bytes, 8192)
+
+    def test_bounded_index_round_trips_and_old_wide_leaves_stay_readable(self):
+        import objectstore as obs
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            entries = self.entries(root, 300)
+            plans, sha = obs.plan_index(root, 'p1', 'evidence', entries)
+            obs.publish(root, plans)
+            self.assertEqual(obs.read_index(root, 'p1', 'evidence', sha, obs.Budget()), entries)
+            # A v0.4 writer produced one leaf of up to 512 entries; it stays readable.
+            leaf = {'schema': obs.INDEX_SCHEMA, 'project_id': 'p1', 'record_type': 'evidence',
+                    'kind': 'leaf', 'count': len(entries), 'entries': entries}
+            data = obs.canonical(leaf).encode('utf-8')
+            wide = obs.sha256_hex(data)
+            obs.publish(root, [{'kind': 'index', 'path': obs.index_path(root, 'evidence', wide),
+                                'content': data, 'sha256': wide}])
+            self.assertEqual(obs.read_index(root, 'p1', 'evidence', wide, obs.Budget()), entries)
+
+
+if __name__ == '__main__':
+    unittest.main()

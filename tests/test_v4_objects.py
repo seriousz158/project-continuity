@@ -285,7 +285,8 @@ class V4ObjectStoreTests(V4Case):
             entry, part = obs.entry_for(self.root, "proj", "evidence", payload)
             entries.append(entry)
             obs.publish(self.root, part)
-        with mock.patch.object(obs, "MAX_INDEX_ENTRIES", 2):
+        with mock.patch.object(obs, "MAX_INDEX_ENTRIES", 2), \
+                mock.patch.object(obs, "INDEX_LEAF_WRITE_ENTRIES", 2):
             plans, root_sha = obs.plan_index(self.root, "proj", "evidence", entries)
         obs.publish(self.root, plans)
         found = obs.read_index(self.root, "proj", "evidence", root_sha, obs.Budget())

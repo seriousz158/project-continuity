@@ -1,0 +1,23 @@
+{
+  "evidence": [
+    {
+      "id": "ev-parser-malformed",
+      "task_id": "parser-tests",
+      "check": "python -m unittest tests.test_parser",
+      "result": "pass",
+      "at": "2026-10-11T00:00:00Z",
+      "ref": "tests/test_parser.py",
+      "acceptance": ["Malformed input is rejected"]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "parser-tests",
+      "title": "Add parser regression coverage",
+      "status": "done",
+      "owner": "agent-a",
+      "depends_on": [],
+      "acceptance": ["Malformed input is rejected"]
+    }
+  ]
+}

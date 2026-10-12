@@ -490,13 +490,19 @@ def _plan_candidate(lines, body, state, updates, project_id, *, force=False, aut
     candidate = render(state)
     ungoverned_bytes = _candidate_bytes(candidate)
     segments, compacted = [], False
-    _limit, trigger, target = p.budget(updates["schema"])
+    limit, trigger, target = p.budget(updates["schema"])
+    surplus = len(state["operations"]) - p.RECEIPT_KEEP
     if updates["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5) and (force or
-            (automatic and ungoverned_bytes >= trigger)):
+            (automatic and ungoverned_bytes >= trigger
+             and (surplus >= p.RECEIPT_SEGMENT_MIN or ungoverned_bytes > limit))):
         state, segments, compacted = _plan_compaction(state, project_id, force=True)
         candidate = render(state)
         if len(candidate.encode("utf-8")) > target:
             candidate = render(state, compact=True)
+    elif updates["schema"] in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5) and automatic \
+            and ungoverned_bytes >= trigger:
+        # Deferred receipt compaction still keeps the derived view compact.
+        candidate = render(state, compact=True)
     final_bytes = _candidate_bytes(candidate)
     return state, candidate, segments, compacted, ungoverned_bytes, final_bytes
 
@@ -843,7 +849,7 @@ def _record_cost(root, project_id, state, record, record_type, reference):
     # including the very first one, so the index cost is always modelled.
     entries = (obs.read_index(root, project_id, record_type, ref["index"], obs.Budget())
                if isinstance(ref, dict) and ref.get("index") is not None else [])
-    split = len(entries) + 1 > obs.MAX_INDEX_ENTRIES
+    split = len(entries) + 1 > obs.INDEX_LEAF_WRITE_ENTRIES
     index_plans, _sha = obs.plan_index(root, project_id, record_type, entries + [entry])
     index_planned, index_unique = _unique_object_bytes(index_plans)
     index_nodes = len(index_plans)
@@ -872,14 +878,15 @@ def _growth_report(root, meta, lines, body, stub):
                           "synthetic_sample": False}}
     project_id = meta["project_id"]
     tasks = stub.get("tasks") or []
-    synthetic = not tasks or not any(task.get("acceptance") for task in tasks)
-    task_id = tasks[0]["id"] if tasks else "growth-task"
-    generation = tasks[0]["generation"] if tasks else 0
-    condition = "growth acceptance condition"
-    for task in tasks:
-        if task.get("acceptance"):
-            condition = task["acceptance"][0]
-            break
+    # A final task cannot take a new acceptance condition without failing the
+    # completion gate, so the sample is the first task that is still open.
+    open_tasks = [task for task in tasks if task.get("status") not in ("done", "cancelled")]
+    sample = open_tasks[0] if open_tasks else None
+    synthetic = sample is None or not sample.get("acceptance")
+    task_id = sample["id"] if sample else "growth-task"
+    generation = sample["generation"] if sample else 0
+    condition = (sample["acceptance"][0] if sample and sample.get("acceptance")
+                 else "growth acceptance condition")
 
     def document_bytes(value):
         return len((metadata(lines, {}) + p.render_body(value, body)).encode("utf-8"))
@@ -913,14 +920,15 @@ def _growth_report(root, meta, lines, body, stub):
         lambda value: value["tasks"].append(
             {"id": "growth-task", "title": "growth task title", "status": "todo",
              "owner": None, "depends_on": [], "acceptance": [condition], "generation": 0}))
-    if tasks:
+    if sample is not None:
+        position = tasks.index(sample)
         report["acceptance"] = measured(
-            lambda value: value["tasks"][0].__setitem__(
-                "acceptance", list(value["tasks"][0]["acceptance"]) + [condition + " extra"]))
+            lambda value: value["tasks"][position].__setitem__(
+                "acceptance", list(value["tasks"][position]["acceptance"]) + [condition + " extra"]))
     else:
         report["acceptance"] = {"current_bytes": 0, "planned_object_bytes": 0,
                                 "new_object_bytes": 0,
-                                "unavailable": "the project has no task to extend"}
+                                "unavailable": "the project has no open task to extend"}
     def ensure_sample_task(value):
         # A decision or blocker must reference a real task, so an empty
         # project needs one synthetic task before the sample is valid.
@@ -942,6 +950,20 @@ def _growth_report(root, meta, lines, body, stub):
             {"id": "growth-blocker", "task_id": task_id,
              "description": "growth blocker", "status": "open"})
 
+    def add_inline_evidence(value):
+        ensure_sample_task(value)
+        owner = next(task for task in value["tasks"] if task["id"] == task_id)
+        value["evidence"].append(
+            {"id": "growth-evidence", "task_id": task_id, "check": "growth probe",
+             "result": "not_run", "at": iso(now()), "ref": "growth/probe", "baseline": {},
+             "acceptance": [condition] if condition in owner["acceptance"] else [],
+             "generation": owner["generation"]})
+
+    if isinstance(stub.get("evidence"), list):
+        report["evidence"] = measured(
+            add_inline_evidence,
+            note="inline evidence grows CURRENT.md; includes one synthetic sample task"
+                 " when the project has no open task")
     report["decision"] = measured(add_decision,
         note="includes one synthetic sample task when the project has none")
     report["blocker"] = measured(add_blocker,
@@ -1365,7 +1387,10 @@ def capacity_view(args, root):
         try:
             result["growth"] = _growth_report(root, meta, lines, body, stub)
         except (RelayError, p.Invalid, fs.Error, OSError, ValueError, KeyError) as exc:
-            detail = exc.code if isinstance(exc, RelayError) else "growth model unavailable"
+            # Invalid messages carry no input values, so they are safe to name.
+            detail = (exc.code if isinstance(exc, RelayError)
+                      else "growth model unavailable: " + str(exc) if isinstance(exc, p.Invalid)
+                      else "growth model unavailable")
             result["growth"] = {"error": detail}
     scan(json.dumps(result, ensure_ascii=False), enforce_limit=False)
     return result
@@ -1745,7 +1770,8 @@ def status(args, root):
         "external": external_check(args),
     }
     result = {"exists": True, "schema": meta["schema"], "revision": int(meta["revision"]),
-              "status": meta["status"], "writer": meta["writer"], "lease_until": meta["lease_until"],
+              "status": meta["status"], "writer": p.meta_value(meta["writer"]),
+              "lease_until": p.meta_value(meta["lease_until"]),
               "lease_active": lease_active(meta), "git": git,
               "drift": block["check"]["state"] == CHECK_STALE,
               "verification": "CONFLICT" if not matches else

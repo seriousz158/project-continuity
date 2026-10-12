@@ -56,7 +56,7 @@ class PackageTests(unittest.TestCase):
                 "--input", "-", input_text="{}")
             status = run("status", "--root", project)
             self.assertEqual(status["revision"], 2)
-            self.assertEqual(status["writer"], "null")
+            self.assertIsNone(status["writer"])
             for test_file in sorted(
                 Path(name).name for name in package_skill.FILES
                 if name.startswith("tests/test_") and name != "tests/test_package.py"
