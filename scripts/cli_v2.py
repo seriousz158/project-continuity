@@ -1830,6 +1830,172 @@ def archive_view(args, root):
             "has_more": offset + len(page) < len(entries), "items": items}
 
 
+GC_KEEP_HISTORY = 50
+GC_SAMPLE = 20
+_SNAPSHOT_NAME = re.compile(r"r([0-9]+)-[0-9a-f]{64}\.md")
+_OBJECT_NAME = re.compile(
+    r"objects/(?:(?:index/)?(?P<type>[a-z-]+)|manifest|chunk)/(?P<shard>[0-9a-f]{2})/"
+    r"(?P<sha>[0-9a-f]{64})\.(?P<ext>json|bin)")
+
+
+def _object_name_ok(name):
+    match = _OBJECT_NAME.fullmatch(name)
+    if match is None or match["shard"] != match["sha"][:2]:
+        return False
+    if name.startswith("objects/chunk/"):
+        return match["ext"] == "bin"
+    if match["ext"] != "json":
+        return False
+    return name.startswith("objects/manifest/") or match["type"] in obs.RECORD_FORMATS
+
+
+def _snapshot_references(root, history, name):
+    """Object files a retained history snapshot still depends on."""
+    try:
+        text = fs.read(fs.child(history, name, exists=True))
+        _lines, body, meta = split(text, enforce_limit=False)
+        if meta["schema"] not in relay_v4.EXTERNAL_SCHEMAS:
+            return []
+        stub, _matches = parsed_body(body)
+        return _reachable_object_names(root, meta, stub)
+    except (fs.Error, p.Invalid, RelayError, OSError, UnicodeError, ValueError, KeyError) as exc:
+        raise p.Invalid(f"retained history snapshot {name} cannot be resolved; nothing was "
+                        "collected (raise --keep-history past it, or recover first)") from exc
+
+
+def _list_files(directory):
+    """Regular files below directory as (relative name, bytes); links are reported apart."""
+    files, foreign = [], []
+    if not directory.is_dir() or directory.is_symlink():
+        return files, foreign
+    for current, directories, names in os.walk(directory, followlinks=False):
+        for name in [d for d in directories if os.path.islink(os.path.join(current, d))]:
+            foreign.append(os.path.relpath(os.path.join(current, name), directory))
+        directories[:] = [d for d in directories if not os.path.islink(os.path.join(current, d))]
+        for name in names:
+            path = Path(current) / name
+            relative = path.relative_to(directory).as_posix()
+            info = path.lstat()
+            if path.is_symlink() or not path.is_file() or info.st_nlink != 1:
+                foreign.append(relative)
+            else:
+                files.append((relative, info.st_size))
+    return sorted(files), sorted(foreign)
+
+
+def _plan_gc(root, keep_history):
+    """Read-only garbage-collection plan: unreachable objects and old snapshots.
+
+    Receipt segments are never candidates.  An object survives when CURRENT or
+    any retained snapshot reaches it, so ``recover --snapshot`` keeps working
+    for every snapshot that is kept.
+    """
+    _document, _lines, _body, meta, stub, _matches = read_envelope(root)
+    relay = fs.child(root, ".relay", exists=True)
+    history = relay / "history"
+    snapshots, foreign_history = _list_files(history)
+    named = []
+    for name, size in snapshots:
+        match = _SNAPSHOT_NAME.fullmatch(name)
+        if match is None:
+            foreign_history.append(name)
+        else:
+            named.append((int(match[1]), name, size))
+    named.sort(reverse=True)
+    retained, expired = named[:keep_history], named[keep_history:]
+    reachable = set(_reachable_object_names(root, meta, stub))
+    current_reachable = len(reachable)
+    for _revision, name, _size in retained:
+        reachable.update(_snapshot_references(root, history, name))
+    # Hand-named copies are never collected; what they still resolve stays too.
+    unresolved = 0
+    for name, _size in snapshots:
+        if _SNAPSHOT_NAME.fullmatch(name) is None and name.endswith(".md"):
+            try:
+                reachable.update(_snapshot_references(root, history, name))
+            except p.Invalid:
+                unresolved += 1
+    objects, foreign_objects = _list_files(relay / "objects")
+    present = {f"objects/{name}" for name, _size in objects}
+    missing = sorted(reachable - present)
+    p.require(not missing, f"{len(missing)} reachable object file(s) are missing; run "
+              "validate --verify-integrity before collecting anything")
+    garbage, unrecognized = [], list(f"objects/{name}" for name in foreign_objects)
+    for name, size in objects:
+        full = f"objects/{name}"
+        if not _object_name_ok(full):
+            unrecognized.append(full)
+        elif full not in reachable:
+            garbage.append((full, size))
+    blocked = None
+    if unresolved:
+        # Their references cannot be read, so no object is provably unreachable.
+        blocked = (f"{unresolved} hand-named history file(s) cannot be parsed; no object is "
+                   "collected until they are moved out of .relay/history")
+        garbage = []
+    receipts = len(_list_files(relay / ARCHIVE_DIR)[0])
+    return {
+        "meta": meta, "expired": expired, "garbage": garbage,
+        "report": {
+            "schema": meta["schema"], "revision": int(meta["revision"]),
+            "keep_history": keep_history,
+            "history": {"total": len(named), "retained": len(retained),
+                        "reclaimable": len(expired),
+                        "reclaimable_bytes": sum(size for _r, _n, size in expired),
+                        "oldest_retained_revision": retained[-1][0] if retained else None,
+                        "sample": [name for _r, name, _s in expired[:GC_SAMPLE]],
+                        "unrecognized": len(foreign_history),
+                        "unrecognized_sample": sorted(foreign_history)[:GC_SAMPLE],
+                        "unrecognized_unresolved": unresolved},
+            "objects": {"total": len(objects), "reachable_from_current": current_reachable,
+                        "reachable": len(reachable), "reclaimable": len(garbage),
+                        "reclaimable_bytes": sum(size for _n, size in garbage),
+                        "sample": [name for name, _s in garbage[:GC_SAMPLE]],
+                        "unrecognized": sorted(unrecognized), "blocked": blocked},
+            "receipt_segments": {"count": receipts, "policy": "never collected"},
+        },
+    }
+
+
+def gc(args, root):
+    """Explicit garbage collection; a preview unless --apply is given.
+
+    --apply needs the live lease of --writer at --expected-revision and runs
+    under the relay lock.  It never changes CURRENT.md, never touches receipt
+    segments, unrecognized files or directories, and deletes only what the
+    preview under the same lock names.
+    """
+    keep = args.keep_history
+    p.require(isinstance(keep, int) and 1 <= keep <= 100000, "--keep-history must be 1 to 100000")
+    if not args.apply:
+        plan = _plan_gc(root, keep)
+        return {**plan["report"], "dry_run": True,
+                "apply": "gc --apply --writer <lease holder> --expected-revision <revision>"}
+    p.require(args.writer is not None and args.expected_revision is not None,
+              "gc --apply requires --writer and --expected-revision of the live lease")
+    p.identifier(args.writer, "writer")
+    fs.child(root, ".relay", "CURRENT.md", exists=True)
+    with fs.locked(fs.child(root, ".relay", "CURRENT.md.lock")):
+        plan = _plan_gc(root, keep)
+        meta = plan["meta"]
+        p.require(meta["schema"] in p.SUPPORTED_SCHEMAS,
+                  "v1 is read-only; migrate before collecting garbage")
+        p.require(int(meta["revision"]) == args.expected_revision, "revision conflict")
+        p.require(meta["writer"] == args.writer and lease_active(meta),
+                  "missing, expired or conflicting lease; resume first")
+        history = fs.child(root, ".relay", "history")
+        for _revision, name, _size in plan["expired"]:
+            fs.remove(fs.child(history, name, exists=True))
+        for name, _size in plan["garbage"]:
+            fs.remove(fs.child(root, ".relay", *name.split("/"), exists=True))
+    report = plan["report"]
+    return {**report, "dry_run": False,
+            "deleted": {"history": report["history"]["reclaimable"],
+                        "objects": report["objects"]["reclaimable"],
+                        "bytes": report["history"]["reclaimable_bytes"]
+                        + report["objects"]["reclaimable_bytes"]}}
+
+
 def _archive_summary(stub, meta):
     if stub is None or meta["schema"] not in p.ARCHIVE_SCHEMAS:
         return None
@@ -2453,7 +2619,7 @@ def parser():
     sub = result.add_subparsers(dest="command", required=True)
     for command in ("init", "status", "validate", "resume", "update", "save", "prune", "compact",
                     "migrate", "recover", "export", "verify", "capacity", "coverage", "handoff",
-                    "markdown", "archive"):
+                    "markdown", "archive", "gc"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--root", default=".")
         if command == "init":
@@ -2541,6 +2707,13 @@ def parser():
         if command == "markdown":
             cmd.add_argument("--section", default=None,
                              help="print one external Markdown section by its stable id")
+        if command == "gc":
+            cmd.add_argument("--apply", action="store_true",
+                             help="delete what the preview names; otherwise preview only")
+            cmd.add_argument("--keep-history", type=int, default=GC_KEEP_HISTORY,
+                             help="newest history snapshots to keep (default 50)")
+            cmd.add_argument("--writer")
+            cmd.add_argument("--expected-revision", type=int)
         if command == "archive":
             cmd.add_argument("--id", default=None,
                              help="print archived records by archive id or original record id")
@@ -2641,6 +2814,8 @@ def dispatch(args, root):
         result = markdown_view(args, root)
     elif args.command == "archive":
         result = archive_view(args, root)
+    elif args.command == "gc":
+        result = gc(args, root)
     elif args.command == "migrate" and getattr(args, "to_latest", False):
         result = migrate_latest(args, root)
     elif args.command in ("compact", "migrate", "prune") and not args.apply and all(

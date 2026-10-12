@@ -48,6 +48,7 @@ FILES = (
     "tests/test_effective_evidence.py",
     "tests/test_git_state.py",
     "tests/test_markdown_semantics.py",
+    "tests/test_gc.py",
     "tests/test_migrate_compare.py",
     "tests/test_progress.py",
     "tests/test_prune.py",

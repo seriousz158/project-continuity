@@ -91,6 +91,17 @@ class V05FixTests(unittest.TestCase):
         tasks = self.call('handoff')['tasks']
         self.assertEqual([task['status'] for task in tasks], ['done'])
 
+    @unittest.skipIf(os.name == 'nt' or os.geteuid() == 0, 'POSIX permissions')
+    def test_read_only_relay_names_the_cause(self):
+        self.call('init')
+        relay = self.root / '.relay'
+        relay.chmod(0o500)
+        self.addCleanup(relay.chmod, 0o700)
+        result = self.call('resume', '--writer', 'agent:a', '--expected-revision', '0',
+                           '--operation-id', 'op1', ok=False)
+        self.assertIn('read-only', json.loads(result.stderr)['error'])
+        self.assertEqual(self.call('status')['revision'], 0)
+
     def test_growth_model_works_when_the_first_task_is_done(self):
         self.call('init', '--schema', 'v2')
         self.leased(0, 'op1')

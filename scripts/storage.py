@@ -403,6 +403,8 @@ def atomic(path: Path, document: str) -> list[str]:
             warnings.append("durability: replacement committed but parent fsync failed")
         return warnings
     except (OSError, UnicodeError, ValueError) as exc:
+        if isinstance(exc, PermissionError):
+            raise Error("atomic write failed before commit: the .relay directory is read-only") from exc
         raise Error("atomic write failed before commit") from exc
     finally:
         if temporary is not None:
@@ -571,6 +573,9 @@ def locked(path: Path):
         if fd is not None:
             os.close(fd)
             fd = None
+        if isinstance(exc, PermissionError):
+            raise Error("cannot acquire relay lock: the .relay directory is read-only"
+                        " (a frozen archive is read with status/handoff only)") from exc
         raise Error("cannot acquire relay lock") from exc
     except BaseException:
         if fd is not None:
@@ -590,6 +595,20 @@ def locked(path: Path):
                         fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+
+def remove(path: Path) -> None:
+    """Unlink one regular, single-link file; links and directories are refused.
+
+    Only ``gc --apply`` calls this, under the relay lock, for a history
+    snapshot or an object file it has proven unreachable.
+    """
+    try:
+        path = _absolute(path)
+        _regular(_check(path))
+        os.unlink(path)
+    except (OSError, ValueError) as exc:
+        raise Error(f"cannot remove {Path(path).name}") from exc
 
 
 def commit(current: Path, history: Path, old_text: str, new_text: str, old_revision: int) -> dict:
