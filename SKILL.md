@@ -44,6 +44,8 @@ After explicit v2 initialization for a new project, treat `.relay/CURRENT.md` as
 - `status` or `validate`: read-only inspection. Do not create `.relay/` when absent.
 - `resume`: review Git drift and acquire or renew a writer lease.
 - `update`: apply a structured partial change while retaining the lease.
+- `prune`: apply an explicitly enumerated, referentially closed historical
+  deletion while retaining the lease; it never deletes external object files.
 - `save`: apply a structured change, archive the previous revision, and release the lease.
 - `migrate`: inspect v1 relay-format conversion with a dry run first; apply only with explicit writer/revision/operation arguments. Treat `mapping_review_required` as `UNVERIFIED`, not as completed project migration.
 - `recover`: only for an expired lease, with a recorded reason; optionally select a history snapshot.
@@ -85,6 +87,13 @@ Read [references/commands.md](references/commands.md) for exact commands. Read [
   is the explicit deep check: it reads every reachable object and index node,
   names every failure, and refuses to report a document whose custom Markdown
   stub, acceptance map or object digests disagree with the bound bytes.
+- Verification frequency (2026-10-04, ADR-T004-007): `--verify-integrity` and digest
+  recomputation are boundary operations, not per-write rituals. Run the deep check at
+  handoff boundaries — export/import, cross-agent or cross-machine transfer, migration,
+  recovery, a suspected disagreement — and when the user or project explicitly asks. Do not
+  re-verify the same content twice in one session, and do not paste hash lists into reports
+  or into `CURRENT.md`: a re-hash of content the same agent just wrote is not independent
+  evidence.
 - Once the user explicitly initializes or enables continuity, update at task start, task completion, and blocker changes. `save` releases the lease. Honor a user's manual-only or other explicit override; never update every message or add a background daemon.
 - Do not add watchers, Git commits, or external actions. If the user opts into Git sharing, share only `CURRENT.md` plus its explicit ignore configuration, never the whole `.relay/` directory.
 - Report observed revision, writer/lease, Git drift, validation results, and gaps separately from merge, release, deployment, or external execution status.

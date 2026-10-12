@@ -25,6 +25,17 @@ python scripts/write_current.py save --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id> \
   --input - < change.json
 
+# Explicitly prune a referentially closed historical set.  The manifest must
+# enumerate every affected task, blocker, evidence and decision ID plus a
+# target revision and reason.  A dry run performs no write; --apply retains the
+# lease so a following save can release it.  External object files are kept.
+python scripts/write_current.py prune --root <project> \
+  --writer <writer-id> --expected-revision <n> --operation-id <unique-id> \
+  --input prune-manifest.json
+python scripts/write_current.py prune --apply --root <project> \
+  --writer <writer-id> --expected-revision <n> --operation-id <unique-id> \
+  --input prune-manifest.json
+
 # Read-only capacity/receipt forecast. It never creates .relay or writes files.
 python scripts/write_current.py compact --root <project>
 
@@ -140,7 +151,9 @@ python scripts/write_current.py capacity --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
 
 # Read-only preview of a real typed patch. With no live lease it models
-# resume->save; while --writer holds the lease it models that writer's save.
+# resume->save for ordinary patches; a prune manifest models
+# resume->update(prune)->save.  While --writer holds the lease it models that
+# writer's save (or update->save for prune).
 # Another writer's live lease is refused by name (RELAY_PREVIEW_LEASE_CONFLICT).
 # It creates no lock, lease, object, receipt or history and never changes
 # CURRENT.md; the real commit rereads and revalidates under the lock.

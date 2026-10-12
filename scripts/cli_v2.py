@@ -727,7 +727,7 @@ def _plan_candidate_from_state(lines, body, state, updates, project_id, *, force
 
 def _commit_model(meta, lines, body, state, command, revision, operation_id, writer,
                   lease_minutes, stamp, *, patch=None, git=None, targets=None,
-                  markdown=None):
+                  markdown=None, root=None):
     """Model one commit exactly as the write path performs it.
 
     An optional typed patch is applied first, using the same ``progress.apply``
@@ -737,9 +737,21 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
     with a different (synthetic) baseline than the commit writes.
     """
     state = copy.deepcopy(state)
+    if patch and root is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS \
+            and p.is_external(state):
+        state = relay_v4.expand(state, root, meta["project_id"])
     if patch:
-        state = p.apply(state, patch, git if git is not None else {"kind": "none"},
-                        targets=targets)
+        if "prune" in patch:
+            state = p.prune(state, patch["prune"])
+            project_patch = patch.get("project")
+            p.require(isinstance(project_patch, dict)
+                      and set(project_patch) == {"next_step"},
+                      "prune requires a next_step project update")
+            p.text(project_patch["next_step"], "next_step", empty=True)
+            state["project"]["next_step"] = project_patch["next_step"]
+        else:
+            state = p.apply(state, patch, git if git is not None else {"kind": "none"},
+                            targets=targets)
     receipt = {"id": operation_id, "hash": "0" * 64, "revision": revision}
     state["operations"] = list(state["operations"]) + [receipt]
     status = state["project"]["status"]
@@ -764,15 +776,22 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
         # captured the same environment it must include them, or the predicted
         # byte count would silently exclude the front-matter change.
         updates.update(git_fields(git))
+    document_state = state
+    if root is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS \
+            and not p.is_external(state):
+        document_state, _plans, _texts = relay_v4.plan_full(
+            state, root, meta["project_id"], targets, markdown=markdown)
     _candidate, projected, segments, would_compact = _plan_candidate_from_state(
-        lines, body, state, updates, meta["project_id"], markdown=markdown)
+        lines, body, document_state, updates, meta["project_id"], markdown=markdown)
     receipt_bytes = len(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    model_state = document_state if (root is not None and
+                                     meta["schema"] in relay_v4.EXTERNAL_SCHEMAS) else state
     return {"command": command, "revision": revision, "operation_id": operation_id,
             "candidate_bytes": projected, "archived_segments": len(segments),
             "would_compact": bool(would_compact), "receipt_bytes": receipt_bytes,
             "writer_bytes": len(writer.encode("utf-8")),
             "operation_id_bytes": len(operation_id.encode("utf-8")),
-            "revision_digits": len(str(revision)), "state": state,
+            "revision_digits": len(str(revision)), "state": model_state,
             "patched": bool(patch)}
 
 
@@ -1157,44 +1176,79 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
     writer = getattr(args, "writer", None) or "preview-writer"
     lease_minutes = getattr(args, "lease_minutes", None) or 30
     operation_id = getattr(args, "operation_id", None)
-    if schema in relay_v4.EXTERNAL_SCHEMAS:
-        full = relay_v4.expand(stub, root, meta["project_id"])
-    else:
-        full = copy.deepcopy(stub)
+    full = copy.deepcopy(stub)
     resolver = relay_v4.make_target_resolver(root, meta["project_id"], stub)
     git = git_state.capture(root)
     if git.get("kind") == "error":
         return {"status": "unavailable", "reason": "Git inspection failed; preview refused"}
     md_patch = patch.get("markdown") if isinstance(patch, dict) else None
     markdown_records = None
+    if schema == p.SCHEMA_V5:
+        markdown_records = relay_v4.collect_markdown(stub, root, meta["project_id"])
     if md_patch is not None:
         p.require(schema == p.SCHEMA_V5, "markdown changes require a v5 document")
-        markdown_records = relay_v4.collect_markdown(stub, root, meta["project_id"])
         markdown_records, _change = p.merge_markdown(markdown_records, md_patch)
     apply_patch = ({key: value for key, value in patch.items() if key != "markdown"}
                    if md_patch is not None else patch)
+    if isinstance(apply_patch, dict) and "prune" in apply_patch:
+        p.require(set(apply_patch) == {"prune", "project"},
+                  "prune input may contain only prune and project")
+        p.require(apply_patch["prune"].get("target_revision") == int(meta["revision"]),
+                  "prune target revision does not match current revision")
     stamp = now()
     revision = int(meta["revision"])
     active = lease_active(meta)
     if active and meta["writer"] != writer:
         raise RelayError(RELAY_PREVIEW_LEASE_CONFLICT,
                          "another writer holds a live lease; no commit can be predicted")
+    is_prune = isinstance(apply_patch, dict) and "prune" in apply_patch
     if active:
-        model = _commit_model(meta, lines, body, full, "save", revision + 1,
-                              operation_id or "preview-save", writer, lease_minutes, stamp,
-                              patch=apply_patch, git=git, targets=resolver,
-                              markdown=markdown_records if schema == p.SCHEMA_V5 else None)
-        steps, mode, commands = [model], "save", ["save"]
+        if is_prune:
+            update = _commit_model(meta, lines, body, full, "update", revision + 1,
+                                   operation_id or "preview-prune", writer, lease_minutes, stamp,
+                                   patch=apply_patch, git=git, targets=resolver,
+                                   markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                   root=root)
+            save = _commit_model(meta, lines, body, update["state"], "save", revision + 2,
+                                 (operation_id + "-save") if operation_id else "preview-save",
+                                 writer, lease_minutes, stamp, git=git, targets=resolver,
+                                 markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                 root=root)
+            steps, mode, commands = [update, save], "update-save", ["update", "save"]
+        else:
+            model = _commit_model(meta, lines, body, full, "save", revision + 1,
+                                  operation_id or "preview-save", writer, lease_minutes, stamp,
+                                  patch=apply_patch, git=git, targets=resolver,
+                                  markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                  root=root)
+            steps, mode, commands = [model], "save", ["save"]
     else:
         resume_op = (operation_id + "-resume") if operation_id else "preview-resume"
-        save_op = (operation_id + "-save") if operation_id else "preview-save"
         first = _commit_model(meta, lines, body, full, "resume", revision + 1, resume_op,
-                              writer, lease_minutes, stamp, git=git, targets=resolver)
-        second = _commit_model(meta, lines, body, first["state"], "save", revision + 2,
-                               save_op, writer, lease_minutes, stamp, patch=apply_patch,
-                               git=git, targets=resolver,
-                               markdown=markdown_records if schema == p.SCHEMA_V5 else None)
-        steps, mode, commands = [first, second], "cycle", ["resume", "save"]
+                              writer, lease_minutes, stamp, git=git, targets=resolver,
+                              root=root)
+        if is_prune:
+            prune_op = (operation_id + "-prune") if operation_id else "preview-prune"
+            update = _commit_model(meta, lines, body, first["state"], "update", revision + 2,
+                                   prune_op, writer, lease_minutes, stamp, patch=apply_patch,
+                                   git=git, targets=resolver,
+                                   markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                   root=root)
+            save_op = (operation_id + "-save") if operation_id else "preview-save"
+            save = _commit_model(meta, lines, body, update["state"], "save", revision + 3,
+                                 save_op, writer, lease_minutes, stamp, git=git,
+                                 targets=resolver,
+                                 markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                 root=root)
+            steps, mode, commands = [first, update, save], "cycle", ["resume", "update", "save"]
+        else:
+            save_op = (operation_id + "-save") if operation_id else "preview-save"
+            second = _commit_model(meta, lines, body, first["state"], "save", revision + 2,
+                                   save_op, writer, lease_minutes, stamp, patch=apply_patch,
+                                   git=git, targets=resolver,
+                                   markdown=markdown_records if schema == p.SCHEMA_V5 else None,
+                                   root=root)
+            steps, mode, commands = [first, second], "cycle", ["resume", "save"]
     summaries = [_step_summary(step, limit) for step in steps]
     final_bytes = summaries[-1]["candidate_bytes"]
     result = {"status": "modelled", "mode": mode, "commands": commands, "schema": schema,
@@ -1205,7 +1259,7 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
               "model": {"writer": writer, "operation_ids": [step["operation_id"] for step in summaries],
                         "lease_minutes": lease_minutes, "clock": iso(stamp),
                         "patch_fields": sorted(patch) if isinstance(patch, dict) else []},
-              "assumptions": ["the typed patch is applied on the save commit",
+              "assumptions": ["the typed patch is applied on its designated commit",
                               "the preview models the same receipt, lease and derived view as a commit"],
               "invalidated_by": ["a concurrent commit changing the revision",
                                  "a different lease state at commit time",
@@ -1215,6 +1269,10 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
         next_step = patch["project"].get("next_step")
         if isinstance(next_step, str):
             result["next_step_bytes"] = len(next_step.encode("utf-8"))
+    if isinstance(patch, dict) and "prune" in patch:
+        prune_spec = patch["prune"]
+        result["prune"] = {key: len(prune_spec.get(key, []))
+                           for key in ("task_ids", "blocker_ids", "evidence_ids", "decision_ids")}
     if result["would_fit"]:
         try:
             nxt = _next_save_cycle(lines, body, steps[-1]["state"], meta, schema,
@@ -1810,7 +1868,7 @@ def input_patch(args):
 
 def mutate(args, root, dry_run=False):
     patch = (input_patch(args)
-             if args.command in ("update", "save")
+             if args.command in ("update", "save", "prune")
              and getattr(args, "input", None) else {})
     # The custom Markdown of a v5 document is a managed, externalised collection:
     # it is applied here (the state has to be resolved first) and never reaches
@@ -1939,10 +1997,16 @@ def mutate(args, root, dry_run=False):
             p.require(not lease_active(meta) or meta["writer"] == args.writer, "lease conflict")
             if full["project"]["status"] == "paused":
                 full["project"]["status"] = "active"
-        elif args.command in ("update", "save", "compact"):
+        elif args.command in ("update", "save", "compact", "prune"):
             p.require(meta["writer"] == args.writer and lease_active(meta), "missing, expired or conflicting lease; resume first")
             if args.command in ("update", "save"):
                 full = p.apply(full, apply_patch, git, targets=target_resolver)
+            elif args.command == "prune":
+                p.require(set(patch) == {"prune", "project"},
+                          "prune input may contain only prune and project")
+                full = p.prune(full, patch["prune"], expected_revision=args.expected_revision)
+                p.text(patch["project"].get("next_step"), "next_step", empty=True)
+                full["project"]["next_step"] = patch["project"]["next_step"]
             if args.command == "save" and "status" not in patch.get("project", {}) and full["project"]["status"] == "active":
                 full["project"]["status"] = "paused"
         elif args.command == "recover":
@@ -1987,7 +2051,7 @@ def mutate(args, root, dry_run=False):
         if args.command == "compact":
             p.require(schema in (p.SCHEMA_V3, p.SCHEMA_V4, p.SCHEMA_V5),
                       "v2 requires explicit migrate --to-v3 before compact")
-        keep_lease = args.command in ("resume", "update", "compact")
+        keep_lease = args.command in ("resume", "update", "prune", "compact")
         timestamp = now()
         if migrate_to_v5:
             # Additive provenance: the v3 to v4 record in extensions.migration is
@@ -2130,7 +2194,7 @@ def mutate(args, root, dry_run=False):
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
-    for command in ("init", "status", "validate", "resume", "update", "save", "compact",
+    for command in ("init", "status", "validate", "resume", "update", "save", "prune", "compact",
                     "migrate", "recover", "export", "verify", "capacity", "coverage", "handoff",
                     "markdown"):
         cmd = sub.add_parser(command)
@@ -2138,7 +2202,7 @@ def parser():
         if command == "init":
             cmd.add_argument("--project-id")
             cmd.add_argument("--name")
-        if command in ("resume", "update", "save", "compact", "migrate", "recover"):
+        if command in ("resume", "update", "save", "prune", "compact", "migrate", "recover"):
             required = command not in ("migrate", "compact")
             cmd.add_argument("--writer", required=required)
             cmd.add_argument("--expected-revision", type=int, required=required)
@@ -2148,8 +2212,11 @@ def parser():
         if command in ("resume", "update", "save", "recover"):
             cmd.add_argument("--no-auto-compact", action="store_true",
                              help="disable automatic receipt compaction for this write")
-        if command in ("update", "save"):
+        if command in ("update", "save", "prune"):
             cmd.add_argument("--input", help="JSON change file, or - for standard input")
+        if command == "prune":
+            cmd.add_argument("--apply", action="store_true",
+                             help="commit the validated cascade; otherwise preview only")
         if command == "compact":
             cmd.add_argument("--apply", action="store_true", help="commit the compaction; otherwise preview only")
         if command == "migrate":
@@ -2237,7 +2304,7 @@ def main(argv=None):
             result = handoff_view(args, root)
         elif args.command == "markdown":
             result = markdown_view(args, root)
-        elif args.command in ("compact", "migrate") and not args.apply and all(
+        elif args.command in ("compact", "migrate", "prune") and not args.apply and all(
                 value is not None for value in (args.writer, args.expected_revision, args.operation_id)):
             result = mutate(args, root, dry_run=True)
         elif args.command == "compact" and not args.apply:

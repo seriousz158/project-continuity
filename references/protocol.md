@@ -290,7 +290,7 @@ conflicts as protocol conflicts. The tool never commits or pushes.
 
 Git identity is computed read-only from raw index/tree records and raw worktree
 bytes (`ls-files` and `ls-tree`), rather than `status` or `diff`; this avoids
-executing configured clean filters during capture. At most 64 MiB of worktree
+executing configured clean filters during capture. At most 256 MiB of worktree
 content is fingerprinted. Tracked symlinks, submodules, non-regular or linked
 files, unmerged indexes, and roots that are not the worktree root are rejected.
 CRLF conversion and repositories that rely on clean filters can be reported

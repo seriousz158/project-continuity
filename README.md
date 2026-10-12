@@ -239,7 +239,7 @@ Runtime data stays local by default. If a team explicitly chooses Git sharing,
 share only `CURRENT.md` and the intentional ignore configuration—never the whole
 `.relay/` directory. Review conflicts by stable record ID.
 
-Git fingerprinting is bounded to 64 MiB of tracked worktree content and fails
+Git fingerprinting is bounded to 256 MiB of tracked worktree content and fails
 closed on unsupported links, submodules, non-regular files, unmerged indexes,
 or unavailable data. Repositories that rely on line-ending conversion or clean
 filters may be conservatively reported as dirty.

@@ -992,6 +992,101 @@ def apply(state, patch, baseline, targets=None):
     return validate(out, targets)
 
 
+def prune(state, spec, expected_revision=None):
+    """Atomically remove an explicitly enumerated, referentially closed set.
+
+    Pruning is deliberately separate from ``apply``: ordinary updates never
+    delete history.  The caller supplies every affected id and the operation
+    refuses a partial cascade (for example, a task whose blocker or evidence
+    is left behind).  External object files are not touched here; the v4/v5
+    writer rebuilds only the reachable indexes after this logical change.
+    """
+    require(isinstance(spec, dict), "prune change must be an object")
+    require(set(spec) == {"task_ids", "blocker_ids", "evidence_ids",
+                          "decision_ids", "reason", "target_revision"},
+            "invalid prune manifest fields")
+    for key in ("task_ids", "blocker_ids", "evidence_ids", "decision_ids"):
+        values = spec[key]
+        require(isinstance(values, list), "prune ids must be lists")
+        require(len(values) == len(set(values)), "duplicate prune id")
+        for value in values:
+            identifier(value)
+    text(spec["reason"], "prune reason")
+    require(type(spec["target_revision"]) is int and spec["target_revision"] >= 0,
+            "invalid prune target revision")
+    if expected_revision is not None:
+        require(spec["target_revision"] == expected_revision,
+                "prune target revision does not match expected revision")
+
+    tasks = keyed(state.get("tasks"), "tasks")
+    blockers = keyed(state.get("blockers"), "blockers")
+    decisions = keyed(state.get("decisions"), "decisions")
+    evidence_rows = state.get("evidence")
+    require(isinstance(evidence_rows, list),
+            "prune requires resolved evidence records")
+    evidence = keyed(evidence_rows, "evidence")
+    removed_tasks = set(spec["task_ids"])
+    removed_blockers = set(spec["blocker_ids"])
+    removed_evidence = set(spec["evidence_ids"])
+    removed_decisions = set(spec["decision_ids"])
+    require(removed_tasks and removed_blockers is not None,
+            "prune requires at least one task")
+    require(removed_tasks <= set(tasks), "prune task id is missing")
+    current_task = state["project"].get("current_task")
+    require(current_task not in removed_tasks, "cannot prune the current task")
+    for task in tasks.values():
+        if task["id"] not in removed_tasks:
+            require(not (set(task.get("depends_on", [])) & removed_tasks),
+                    "retained task depends on a pruned task")
+
+    require(removed_blockers <= set(blockers), "prune blocker id is missing")
+    expected_blockers = {row["id"] for row in blockers.values()
+                         if row.get("task_id") in removed_tasks}
+    require(removed_blockers == expected_blockers,
+            "prune blocker cascade is incomplete")
+    for blocker_id in removed_blockers:
+        require(blockers[blocker_id].get("task_id") in removed_tasks,
+                "prune blocker belongs to a retained task")
+
+    require(removed_evidence <= set(evidence), "prune evidence id is missing")
+    expected_evidence = {row["id"] for row in evidence.values()
+                         if row.get("task_id") in removed_tasks}
+    require(removed_evidence == expected_evidence,
+            "prune evidence cascade is incomplete")
+
+    require(removed_decisions <= set(decisions), "prune decision id is missing")
+    expected_decisions = {row["id"] for row in decisions.values()
+                          if set(row.get("task_ids", [])) & removed_tasks}
+    require(removed_decisions == expected_decisions,
+            "prune decision cascade is incomplete")
+
+    corrections = state.get("corrections", [])
+    if isinstance(corrections, list):
+        for correction in corrections:
+            target_id = correction.get("target_id")
+            require(target_id not in removed_evidence | removed_decisions,
+                    "prune would orphan a correction target")
+    elif isinstance(corrections, dict):
+        # An unresolved external index cannot be safely filtered without
+        # resolving it first; the v4/v5 writer always supplies a full state.
+        require(False, "prune requires resolved corrections")
+
+    out = copy.deepcopy(state)
+    out["tasks"] = [row for row in state["tasks"] if row["id"] not in removed_tasks]
+    out["blockers"] = [row for row in state["blockers"] if row["id"] not in removed_blockers]
+    out["evidence"] = [row for row in evidence_rows if row["id"] not in removed_evidence]
+    out["decisions"] = [row for row in state["decisions"] if row["id"] not in removed_decisions]
+    scopes = out.get("extensions", {}).get("blocker_scope")
+    if isinstance(scopes, dict) and isinstance(scopes.get("entries"), list):
+        scopes = copy.deepcopy(scopes)
+        scopes["entries"] = [entry for entry in scopes["entries"]
+                              if entry.get("blocker_id") not in removed_blockers]
+        out["extensions"]["blocker_scope"] = scopes
+    if "ac_map" in out.get("extensions", {}):
+        out["extensions"]["ac_map"] = build_ac_map(out["tasks"])
+    return validate(out)
+
+
 def display(value):
     # Display is never parsed as task state. JSON encoding keeps injected headings inert.
     return json.dumps(value, ensure_ascii=False).replace("<", "&lt;").replace(">", "&gt;").replace("`", "&#96;")

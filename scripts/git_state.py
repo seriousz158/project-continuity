@@ -9,7 +9,10 @@ from pathlib import Path
 
 import storage
 
-MAX_FINGERPRINT_BYTES = 64 * 1024 * 1024
+# ToFu's canonical code checkout is larger than the historical 64 MiB guard.
+# Keep a bounded fail-closed budget, but allow the official Relay writer to
+# fingerprint a full verified checkout rather than forcing a sparse mirror.
+MAX_FINGERPRINT_BYTES = 256 * 1024 * 1024
 
 
 def capture(root):
@@ -79,7 +82,7 @@ def capture(root):
                 return error('raw fingerprint requires regular nonlinked files; submodules are unsupported')
             total += before.st_size
             if total > MAX_FINGERPRINT_BYTES:
-                return error('raw fingerprint exceeds 64 MiB budget')
+                return error('raw fingerprint exceeds 256 MiB budget')
             # Frame binary content and include executable permissions even when
             # the repository was already dirty before a mode-only change.
             executable_bits = before.st_mode & 0o111 if os.name != 'nt' else 0

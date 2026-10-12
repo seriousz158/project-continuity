@@ -199,7 +199,7 @@ Project Continuity 明确不会：
 
 运行态默认保存在本地。团队明确选择 Git 共享时，只共享 `CURRENT.md` 和有意设置的 ignore 配置，绝不共享整个 `.relay/`。冲突必须按稳定记录 ID 审查。
 
-Git 指纹最多读取 64 MiB tracked 工作区内容；遇到不支持的链接、submodule、非普通文件、未合并 index 或不可用数据时会失败关闭。依赖换行转换或 clean filter 的仓库可能被保守地报告为 dirty。
+Git 指纹最多读取 256 MiB tracked 工作区内容；遇到不支持的链接、submodule、非普通文件、未合并 index 或不可用数据时会失败关闭。依赖换行转换或 clean filter 的仓库可能被保守地报告为 dirty。
 
 ## 兼容性
 
