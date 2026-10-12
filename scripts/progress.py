@@ -156,9 +156,9 @@ def text(value, label, empty=False):
             label + " contains unsupported content")
 
 
-def identifier(value):
+def identifier(value, label=None):
     require(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", value),
-            "invalid identifier")
+            "invalid identifier" + (": " + label if label else ""))
 
 
 def timestamp(value):

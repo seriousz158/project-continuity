@@ -77,13 +77,18 @@ def split(document, enforce_limit=True):
         meta[key] = value.strip()
     p.require(meta.get("schema") in ("project-continuity/v1", *p.SUPPORTED_SCHEMAS), "unsupported schema")
     p.require(re.fullmatch(r"[0-9]+", meta.get("revision", "")), "invalid revision")
-    p.identifier(meta.get("project_id"))
+    p.identifier(meta.get("project_id"), "project_id")
     p.require(meta.get("status") in ("active", "paused", "blocked", "complete"), "invalid metadata status")
     p.timestamp(meta.get("updated_at"))
+    if meta["schema"] == "project-continuity/v1":
+        # Hand-written v1 documents sometimes leave an absent lease empty.
+        for key in ("writer", "lease_until"):
+            if meta.get(key) == "":
+                meta[key] = "null"
     writer, until = meta.get("writer"), meta.get("lease_until")
     p.require(writer is not None and until is not None, "missing lease fields")
     if writer != "null":
-        p.identifier(writer)
+        p.identifier(writer, "writer")
         p.timestamp(until)
     else:
         p.require(until == "null", "lease without writer")
@@ -2759,7 +2764,9 @@ def dispatch(args, root):
             result = {"migration_required": False, "revision": int(meta["revision"]), "schema": meta["schema"]}
         else:
             state, body, _ = migration(old, body, meta)
-            candidate = checked(metadata(lines, {"schema": p.SCHEMA, "status": "paused"}) + body)
+            candidate = checked(metadata(lines, {"schema": p.SCHEMA, "status": "paused",
+                                                 "writer": meta["writer"],
+                                                 "lease_until": meta["lease_until"]}) + body)
             result = {"dry_run": True, "source_sha256": hashlib.sha256(old.encode()).hexdigest(),
                       "revision": int(meta["revision"]), "candidate_bytes": len(candidate.encode()),
                       "mapping_review_required": True}

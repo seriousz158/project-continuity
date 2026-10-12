@@ -269,6 +269,16 @@ class V6MigrationTests(V6Case):
         self.assertIn("source hash", refused["error"])
         self.assertEqual(self.call("status")["schema"], p.SCHEMA_V2)
 
+    def test_v1_with_empty_lease_fields_is_readable_and_errors_name_fields(self):
+        relay = self.root / ".relay"
+        relay.mkdir()
+        legacy = V1.replace("writer: null\nlease_until: null", "writer:\nlease_until:")
+        (relay / "CURRENT.md").write_text(legacy, encoding="utf-8")
+        self.assertEqual(self.call("status")["schema"], "project-continuity/v1")
+        (relay / "CURRENT.md").write_text(V1.replace("project_id: legacy-test",
+                                                     "project_id: bad id"), encoding="utf-8")
+        self.assertIn("project_id", self.call("status", expect=2)["error"])
+
     def test_to_latest_converts_v1_first(self):
         relay = self.root / ".relay"
         relay.mkdir()
