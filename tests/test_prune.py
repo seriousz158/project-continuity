@@ -130,7 +130,7 @@ class PruneCase(unittest.TestCase):
         self.assertEqual(committed["revision"], rev + 1)
         self.call("save", "--writer", "w", "--expected-revision", str(rev + 1),
                   "--operation-id", "s-prune")
-        state = relay_v4.resolve((self.root / ".relay" / "CURRENT.md").read_text(), self.root)
+        state = relay_v4.resolve((self.root / ".relay" / "CURRENT.md").read_text(encoding="utf-8"), self.root)
         self.assertEqual([r["id"] for r in state["tasks"]], ["current"])
         self.assertEqual([r["id"] for r in state["evidence"]], ["ev-current"])
         self.assertFalse(state["blockers"])

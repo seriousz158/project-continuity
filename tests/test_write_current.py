@@ -120,7 +120,7 @@ class CliTests(unittest.TestCase):
     def test_v1_migration_is_explicit_and_preserves_unknown(self):
         (self.root/'.relay').mkdir()
         current = self.root/'.relay/CURRENT.md'
-        current.write_text(V1, encoding="utf-8")
+        current.write_text(V1, encoding="utf-8", newline="\n")
         before = current.read_bytes()
         preview = self.call('migrate')
         self.assertEqual(current.read_bytes(), before)
@@ -155,11 +155,11 @@ class CliTests(unittest.TestCase):
     def test_git_same_head_dirty_drift(self):
         subprocess.run(['git','init','-q',str(self.root)],check=True)
         self.call('init', '--schema', 'v2')
-        (self.root/'untracked.txt').write_text('first', encoding="utf-8")
+        (self.root/'untracked.txt').write_text('first', encoding="utf-8", newline="\n")
         self.call('resume','--writer','a','--expected-revision','0','--operation-id','r',ok=False)
         self.call('resume','--writer','a','--expected-revision','0','--operation-id','r','--allow-drift')
         before = self.call('status')['git']['fingerprint']
-        (self.root/'untracked.txt').write_text('second', encoding="utf-8")
+        (self.root/'untracked.txt').write_text('second', encoding="utf-8", newline="\n")
         after = self.call('status')
         self.assertNotEqual(before,after['git']['fingerprint'])
         self.assertTrue(after['drift'])

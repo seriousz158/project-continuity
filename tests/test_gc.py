@@ -94,11 +94,11 @@ class GcTests(unittest.TestCase):
         relay = self.root / ".relay"
         receipts = sorted((relay / "receipts").rglob("*")) if (relay / "receipts").exists() else []
         foreign = relay / "objects/NOTES.txt"
-        foreign.write_text("not an object\n", encoding="utf-8")
+        foreign.write_text("not an object\n", encoding="utf-8", newline="\n")
         orphan_sha = "ab" + "0" * 62
         orphan = relay / "objects/evidence/ab" / f"{orphan_sha}.json"
         orphan.parent.mkdir(parents=True, exist_ok=True)
-        orphan.write_text("{}", encoding="utf-8")
+        orphan.write_text("{}", encoding="utf-8", newline="\n")
         preview = self.call("gc", "--keep-history", "2")
         self.assertIn(f"objects/evidence/ab/{orphan_sha}.json", preview["objects"]["sample"])
         self.assertIn("objects/NOTES.txt", preview["objects"]["unrecognized"])

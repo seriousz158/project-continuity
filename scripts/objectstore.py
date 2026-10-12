@@ -520,6 +520,11 @@ def chunked_manifest_digests(root: Path, project_id: str, record_type: str, inde
             if entry["storage"] == "chunked"]
 
 
+def _relay_name(path: Path, relay: Path) -> str:
+    """A path under .relay as a portable, '/'-separated name (also on Windows)."""
+    return "/".join(path.relative_to(relay).parts)
+
+
 def index_paths(root: Path, project_id: str, record_type: str, index_sha,
                budget=None) -> list:
     """Relative object file names (under .relay/) reachable from a collection."""
@@ -538,7 +543,7 @@ def index_paths(root: Path, project_id: str, record_type: str, index_sha,
         seen.add(sha)
         path = index_path(root, record_type, sha)
         raw = _read_hashed(path, sha, budget, RELAY_INDEX_INVALID, "index node")
-        out.append(str(path.relative_to(relay)))
+        out.append(_relay_name(path, relay))
         node = loads_named(raw.decode("utf-8"), RELAY_INDEX_INVALID, "index node")
         if node.get("kind") == "branch":
             for child in node["children"]:
@@ -547,16 +552,15 @@ def index_paths(root: Path, project_id: str, record_type: str, index_sha,
     walk(index_sha, 1)
     for entry in entries:
         if entry["storage"] == "single":
-            out.append(str(object_path(root, record_type,
-                                       entry["object_sha256"]).relative_to(relay)))
+            out.append(_relay_name(object_path(root, record_type, entry["object_sha256"]), relay))
         else:
             manifest = manifest_path(root, entry["manifest_sha256"])
             raw = _read_hashed(manifest, entry["manifest_sha256"], budget,
                                RELAY_OBJECT_MISSING, "chunk manifest")
-            out.append(str(manifest.relative_to(relay)))
+            out.append(_relay_name(manifest, relay))
             node = loads_named(raw.decode("utf-8"), RELAY_OBJECT_SCHEMA_INVALID, "chunk manifest")
             for ref in node["chunks"]:
-                out.append(str(chunk_path(root, ref["sha256"]).relative_to(relay)))
+                out.append(_relay_name(chunk_path(root, ref["sha256"]), relay))
     unique = sorted(set(out))
     if len(unique) > MAX_OBJECTS:
         raise RelayError(RELAY_OBJECT_LIMIT_EXCEEDED, "too many reachable object files")

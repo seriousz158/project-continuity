@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts/write_current.py'
@@ -184,6 +185,46 @@ class ReferenceAssuranceTests(unittest.TestCase):
         record = self.call('coverage', '--acknowledge-external')['verification_record']
         self.assertEqual(record['assurance'], 'externally_checked')
         self.assertTrue(record['checks']['references']['verified'])
+
+
+class WindowsPortabilityTests(unittest.TestCase):
+    """CRLF documents (a Git autocrlf checkout) and native path separators."""
+
+    def test_custom_region_and_sections_accept_crlf(self):
+        import progress as p
+        region = "\r\n## Goal\r\n- keep\r\n## State\r\n- now\r\n"
+        body = region + p.DATA_START.replace("\n", "\r\n") + "{}" + p.DATA_END.replace("\n", "\r\n")
+        self.assertEqual(p.custom_region(body), region)
+        self.assertTrue(p.render_region(body, "X").startswith("X<!-- project-continuity:data"))
+        sections = p.split_markdown(region)
+        self.assertEqual([s["title"] for s in sections], [p.MARKDOWN_PREAMBLE_TITLE, "Goal", "State"])
+        self.assertEqual("".join(s["content"] for s in sections), region)
+
+    def test_reachable_object_names_use_forward_slashes(self):
+        import objectstore as obs
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            entries = IndexFanoutTests().entries(root, 3)
+            plans, sha = obs.plan_index(root, 'p1', 'evidence', entries)
+            obs.publish(root, plans)
+            with mock.patch.object(obs.Path, 'relative_to', _backslash_relative_to):
+                names = obs.index_paths(root, 'p1', 'evidence', sha, obs.Budget())
+            self.assertTrue(names)
+            self.assertFalse(any('\\' in name for name in names), names)
+
+
+def _backslash_relative_to(self, *other, **kwargs):
+    """Simulate a Windows path whose str() uses backslashes."""
+    relative = _ORIGINAL_RELATIVE_TO(self, *other, **kwargs)
+    return _WindowsLike(relative)
+
+
+class _WindowsLike(type(Path())):
+    def __str__(self):
+        return super().__str__().replace('/', '\\')
+
+
+_ORIGINAL_RELATIVE_TO = Path.relative_to
 
 
 class IndexFanoutTests(unittest.TestCase):

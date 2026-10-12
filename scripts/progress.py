@@ -329,18 +329,22 @@ def validate_markdown(records):
     return records
 
 
+def _data_start(body):
+    # Same line-ending tolerance as block(): a Git autocrlf checkout is CRLF.
+    pattern = r"\r?\n".join(re.escape(line) for line in DATA_START.split("\n"))
+    match = re.search(pattern, body)
+    require(match is not None, "missing managed data section")
+    return match.start()
+
+
 def custom_region(body):
     """The unmanaged Markdown region of a body: everything before the data block."""
-    position = body.find(DATA_START)
-    require(position >= 0, "missing managed data section")
-    return body[:position]
+    return body[:_data_start(body)]
 
 
 def render_region(body, region):
     """Replace the unmanaged region, leaving both managed blocks byte-identical."""
-    position = body.find(DATA_START)
-    require(position >= 0, "missing managed data section")
-    return region + body[position:]
+    return region + body[_data_start(body):]
 
 
 def split_markdown(region):
@@ -357,7 +361,8 @@ def split_markdown(region):
         if heading.startswith("## "):
             title = heading[3:].strip()
             markdown_title(title)
-            require(part == "## " + title or part.startswith("## " + title + "\n"),
+            require(part.rstrip("\r") == "## " + title
+                    or part.startswith(("## " + title + "\n", "## " + title + "\r\n")),
                     "unsupported Markdown section heading")
         else:
             require(not part.strip(), "custom Markdown must start with a level-2 heading")

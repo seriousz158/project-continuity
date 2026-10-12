@@ -65,6 +65,10 @@ collection, graded evidence assurance and a one-command upgrade.
   task is finished, instead of reporting the model as unavailable.
 - The package allowlist now contains every test module, and a test enforces it.
 - The Git fingerprint budget is 256 MiB (was 64 MiB).
+- Windows: object names reachable from a document are `/`-separated on every
+  platform, which repairs `export` and lets `gc` find reachable objects; the
+  custom Markdown region of a v5/v6 document is read from CRLF files (for
+  example a Git autocrlf checkout) like the managed blocks already were.
 
 ### Migration notes
 

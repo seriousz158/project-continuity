@@ -124,7 +124,7 @@ class IntegrityCase(unittest.TestCase):
         return (self.root / ".relay" / "CURRENT.md").read_text(encoding="utf-8")
 
     def write_current(self, text):
-        (self.root / ".relay" / "CURRENT.md").write_text(text, encoding="utf-8")
+        (self.root / ".relay" / "CURRENT.md").write_text(text, encoding="utf-8", newline="\n")
 
     def doc_and_stub(self):
         text = self.current()

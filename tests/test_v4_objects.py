@@ -362,7 +362,7 @@ class V4ObjectStoreTests(V4Case):
         tampered["evidence"]["count"] = 7
         current = self.root / ".relay" / "CURRENT.md"
         current.write_text(cli.metadata(lines, {}) + p.render_body(tampered, body),
-                           encoding="utf-8")
+                           encoding="utf-8", newline="\n")
         with self.assertRaises(cli.RelayError) as caught:
             relay_v4.resolve(current.read_text(encoding="utf-8"), self.root)
         self.assertEqual(caught.exception.code, "RELAY_INDEX_INVALID")

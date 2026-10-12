@@ -97,7 +97,7 @@ class CapacityTests(unittest.TestCase):
     def test_corrupt_receipt_chain_is_read_only_degraded(self):
         self.make_archived()
         receipt = next((self.root / ".relay/receipts").iterdir())
-        receipt.write_text(receipt.read_text(encoding="utf-8") + "tamper\n", encoding="utf-8")
+        receipt.write_text(receipt.read_text(encoding="utf-8") + "tamper\n", encoding="utf-8", newline="\n")
         status = self.call("status")[1]
         # A degraded archive is named by its own check and never yields a
         # verified conclusion; the top-level word is the verification verdict.
@@ -129,7 +129,7 @@ class CapacityTests(unittest.TestCase):
         document = (self.root / ".relay/CURRENT.md").read_text(encoding="utf-8")
         _limit, trigger, _target = cli.p.budget(cli.p.SCHEMA_V3)
         padding = "\n" + "x" * (trigger - len(document.encode()) + 512) + "\n"
-        (self.root / ".relay/CURRENT.md").write_text(document + padding, encoding="utf-8")
+        (self.root / ".relay/CURRENT.md").write_text(document + padding, encoding="utf-8", newline="\n")
         segments = lambda: len(list((self.root / ".relay/receipts").iterdir()))
         before = segments()
         self.assertEqual(self.call("resume", "--writer", "a", "--expected-revision", "38",
@@ -170,7 +170,7 @@ class CapacityTests(unittest.TestCase):
             result = self.call(command, "--writer", writer, "--expected-revision", str(revision),
                                "--operation-id", f"handoff-{revision}")
             self.assertEqual(result[0], 0, result[2])
-        self.assertTrue(current.read_text().endswith(padding))
+        self.assertTrue(current.read_text(encoding="utf-8").endswith(padding))
         self.assertEqual(self.call("validate")[0], 0)
 
     def test_archive_and_history_failures_leave_current_unchanged(self):

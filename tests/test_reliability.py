@@ -33,7 +33,7 @@ class ReliabilityTests(unittest.TestCase):
 
     def test_expired_lease_rejected(self):
         lines, body, meta=cli.split(self.current.read_text(encoding="utf-8"))
-        self.current.write_text(cli.metadata(lines,{'lease_until':'2000-01-01T00:00:00Z'})+body, encoding="utf-8")
+        self.current.write_text(cli.metadata(lines,{'lease_until':'2000-01-01T00:00:00Z'})+body, encoding="utf-8", newline="\n")
         before=self.current.read_bytes()
         self.assertEqual(self.save()[0],2)
         self.assertEqual(self.current.read_bytes(),before)
@@ -82,7 +82,7 @@ class ReliabilityTests(unittest.TestCase):
     def test_explicit_recovery_repairs_only_derived_view(self):
         self.assertEqual(self.save()[0], 0)
         original = self.current.read_text(encoding="utf-8")
-        self.current.write_text(original.replace('## Tasks', '## Tampered display'), encoding="utf-8")
+        self.current.write_text(original.replace('## Tasks', '## Tampered display'), encoding="utf-8", newline="\n")
         self.assertEqual(self.call('validate')[0], 2)
         code, result = self.call('recover', '--writer', 'b', '--expected-revision', '2',
                                  '--operation-id', 'fix-view', '--reason', 'Regenerate reviewed display')

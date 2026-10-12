@@ -287,7 +287,7 @@ from the installed directory.
 
 ## Verification
 
-The `v0.5.0` suite covers 250 tests, including the v6 cold archive and its
+The `v0.5.0` suite covers 252 tests, including the v6 cold archive and its
 lossless migration, receipt batching, garbage collection, evidence assurance,
 archived retries, injected storage failures, and clean package execution.
 The [CI matrix](https://github.com/seriousz158/project-continuity/actions/workflows/ci.yml)

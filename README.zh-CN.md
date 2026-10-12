@@ -226,7 +226,7 @@ python scripts/write_current.py --help
 
 ## 验证情况
 
-`v0.5.0` 包含 250 项测试，覆盖 v6 冷归档及其无损迁移、回执分批、垃圾回收、证据分级、历史重试、存储故障注入和干净发行包运行。
+`v0.5.0` 包含 252 项测试，覆盖 v6 冷归档及其无损迁移、回执分批、垃圾回收、证据分级、历史重试、存储故障注入和干净发行包运行。
 [CI 矩阵](https://github.com/seriousz158/project-continuity/actions/workflows/ci.yml)
 覆盖 macOS、Linux、Windows × Python 3.11–3.13；具体提交的结果见 Release Notes。
 私有历史快照容量演练保留了项目记录与自定义正文，没有应用待处理业务补丁，也不代表真实项目切换。

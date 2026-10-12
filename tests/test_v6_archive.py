@@ -188,7 +188,7 @@ class V6PreviewTests(V6Case):
         self.call("init", frozen=frozen)
         self.leased(frozen=frozen)
         path = self.root / "change.json"
-        path.write_text(json.dumps(big_patch()), encoding="utf-8")
+        path.write_text(json.dumps(big_patch()), encoding="utf-8", newline="\n")
         preview = self.call("capacity", "--writer", "a", "--operation-id", "s1",
                             "--input", str(path), frozen=frozen)["patch_preview"]
         committed = self.call("save", "--writer", "a", "--expected-revision", "1",
@@ -273,16 +273,17 @@ class V6MigrationTests(V6Case):
         relay = self.root / ".relay"
         relay.mkdir()
         legacy = V1.replace("writer: null\nlease_until: null", "writer:\nlease_until:")
-        (relay / "CURRENT.md").write_text(legacy, encoding="utf-8")
+        (relay / "CURRENT.md").write_text(legacy, encoding="utf-8", newline="\n")
         self.assertEqual(self.call("status")["schema"], "project-continuity/v1")
         (relay / "CURRENT.md").write_text(V1.replace("project_id: legacy-test",
-                                                     "project_id: bad id"), encoding="utf-8")
+                                                     "project_id: bad id"), encoding="utf-8",
+                                       newline="\n")
         self.assertIn("project_id", self.call("status", expect=2)["error"])
 
     def test_to_latest_converts_v1_first(self):
         relay = self.root / ".relay"
         relay.mkdir()
-        (relay / "CURRENT.md").write_text(V1, encoding="utf-8")
+        (relay / "CURRENT.md").write_text(V1, encoding="utf-8", newline="\n")
         preview = self.call("migrate", "--to-latest")
         self.assertEqual(preview["steps"][0]["to_schema"], p.SCHEMA_V2)
         result = self.call("migrate", "--to-latest", "--apply", "--writer", "a",

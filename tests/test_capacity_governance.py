@@ -66,7 +66,7 @@ class CapacityGovernanceCase(unittest.TestCase):
 
     def patch_file(self, patch):
         path = self.root / "change.json"
-        path.write_text(json.dumps(patch, ensure_ascii=False), encoding="utf-8")
+        path.write_text(json.dumps(patch, ensure_ascii=False), encoding="utf-8", newline="\n")
         return str(path)
 
     def current_bytes(self):
@@ -223,7 +223,7 @@ class PatchPreviewTests(CapacityGovernanceCase):
         grown["tasks"] = [task(i) for i in range(count)]
         while len(render(grown).encode("utf-8")) > p.MAX_BYTES - 300:
             grown["tasks"].pop()
-        (self.root / ".relay" / "CURRENT.md").write_text(render(grown), encoding="utf-8")
+        (self.root / ".relay" / "CURRENT.md").write_text(render(grown), encoding="utf-8", newline="\n")
         self.assertLessEqual(self.current_bytes(), p.MAX_BYTES)
         preview = self.call("capacity", "--writer", "w",
                             "--input", self.patch_file(

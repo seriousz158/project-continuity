@@ -112,8 +112,8 @@ class CompareTests(CompareCase):
             migrate_compare.logical_state(after, None)
         before_file = self.root / "before.md"
         after_file = self.root / "after.md"
-        before_file.write_text(before, encoding="utf-8")
-        after_file.write_text(after, encoding="utf-8")
+        before_file.write_text(before, encoding="utf-8", newline="\n")
+        after_file.write_text(after, encoding="utf-8", newline="\n")
         # The tool prints its refusal as JSON on stdout; capture it so the
         # aggregate suite output is not polluted by an expected error line.
         out = io.StringIO()
