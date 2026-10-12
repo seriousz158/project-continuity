@@ -1153,6 +1153,59 @@ def _reference_kind(value):
     return "plain_path_reference"
 
 
+def _bound_object(path):
+    """True when a content-addressed file exists and its bytes match its name."""
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > obs.OBJECT_MAX_BYTES:
+            return False
+        return hashlib.sha256(path.read_bytes()).hexdigest() == path.name.split(".", 1)[0]
+    except OSError:
+        return False
+
+
+def _grade_reference(root, value):
+    """Assurance of one evidence `ref`, read-only and bounded to the project root."""
+    kind = _reference_kind(value)
+    relay = root / ".relay"
+    if kind == "protocol_object_reference":
+        relative = value.split(".relay/", 1)[1] if ".relay/" in value else value
+        if ".." in Path(relative).parts:
+            return "claimed"
+        return "ref_bound" if _bound_object(relay / relative) else "claimed"
+    if kind == "content_digest":
+        matches = sorted((relay / "objects").glob(f"*/{value[:2]}/{value}.*")) + \
+            sorted((relay / "objects").glob(f"index/*/{value[:2]}/{value}.*"))
+        return "ref_bound" if any(_bound_object(path) for path in matches) else "claimed"
+    if kind != "plain_path_reference" or "\n" in value or len(value) > 1024:
+        return "claimed"
+    # `a.md; b/manifest.json` names several files; every one of them must exist.
+    parts = [part.strip() for part in value.split(";")]
+    return "ref_resolved" if all(_path_exists(root, part) for part in parts) else "claimed"
+
+
+def _path_exists(root, value):
+    # A pointer such as `tests/test_x.py:12` or `REPORT.md#summary` names a file.
+    target = re.sub(r"(#.*|:\d+(:\d+)?)$", "", value)
+    candidate = Path(target)
+    if not target or candidate.is_absolute() or ".." in candidate.parts:
+        return False
+    try:
+        resolved = (root / candidate).resolve()
+        resolved.relative_to(root.resolve())
+        return resolved.exists()
+    except (OSError, ValueError):
+        return False
+
+
+def grade_references(root, state):
+    """Per-evidence assurance for the shared verification judgement."""
+    records = state.get("evidence") if isinstance(state, dict) else None
+    if not isinstance(records, list):
+        return {}
+    return {record["id"]: _grade_reference(root, record.get("ref"))
+            for record in records if isinstance(record, dict) and "id" in record}
+
+
 def _long_record_hints(state, threshold):
     """Non-blocking, byte-based hints; never truncates or rewrites content.
 
@@ -1581,7 +1634,8 @@ def coverage_view(args, root):
                                                          bool(getattr(args, "verify_integrity",
                                                                   False)), state),
                                flags={"acknowledge_external":
-                                      bool(getattr(args, "acknowledge_external", False))},
+                                      bool(getattr(args, "acknowledge_external", False)),
+                                      "evidence_assurance": grade_references(root, state)},
                                block=block)
     # The CLI contributes only its own observation of the environment and its
     # integrity/external flags; the check set and the verification record come
@@ -1643,7 +1697,8 @@ def handoff_view(args, root):
                                       bool(getattr(args, "verify_integrity", False)),
                                       state),
             flags={"acknowledge_external":
-                   bool(getattr(args, "acknowledge_external", False))},
+                   bool(getattr(args, "acknowledge_external", False)),
+                   "evidence_assurance": grade_references(root, state)},
             block=block)
     except RelayError as exc:
         if "cursor" in str(exc):

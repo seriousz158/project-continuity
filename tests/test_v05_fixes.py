@@ -108,6 +108,70 @@ class V05FixTests(unittest.TestCase):
         self.assertGreater(growth['evidence']['current_bytes'], 0)
 
 
+class ReferenceAssuranceTests(unittest.TestCase):
+    """A claimed pass satisfies the gate but is never reported as verified."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
+        (self.root / 'logs').mkdir()
+        (self.root / 'logs/parser.txt').write_text('ok\n', encoding='utf-8')
+
+    def call(self, *args, patch=None):
+        result = run(self.root, *args, patch=patch)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def record(self, ref):
+        self.call('init')
+        self.call('resume', '--writer', 'a', '--expected-revision', '0', '--operation-id', 'r')
+        self.call('save', '--writer', 'a', '--expected-revision', '1', '--operation-id', 's',
+                  '--input', '-', patch={
+                      'tasks': [{'id': 't1', 'title': 'x', 'status': 'done',
+                                 'acceptance': ['works']}],
+                      'evidence': [{'id': 'e1', 'task_id': 't1', 'check': 'unit',
+                                    'result': 'pass', 'at': '2026-10-11T00:00:00Z',
+                                    'ref': ref, 'acceptance': ['works']}]})
+
+    def test_missing_reference_is_self_reported(self):
+        self.record('logs/missing.txt')
+        for view in (self.call('coverage'), self.call('handoff')):
+            record = view['verification_record']
+            self.assertFalse(record['verified'])
+            self.assertEqual(record['reason'], 'evidence_self_reported')
+            self.assertEqual(record['assurance'], 'claimed')
+            self.assertEqual(record['checks']['references']['self_reported'], ['e1'])
+            self.assertTrue(record['checks']['coverage']['verified'])
+
+    def test_resolved_reference_is_verified(self):
+        self.record('logs/parser.txt:3')
+        coverage = self.call('coverage')
+        self.assertTrue(coverage['verification_record']['verified'], coverage['verification_record'])
+        self.assertEqual(coverage['verification_record']['assurance'], 'ref_resolved')
+        self.assertEqual(coverage['rows'][0]['assurance'], 'ref_resolved')
+
+    def test_every_path_of_a_multi_path_reference_must_exist(self):
+        (self.root / 'logs/report.md').write_text('ok\n', encoding='utf-8')
+        self.record('logs/parser.txt; logs/report.md#summary')
+        self.assertEqual(self.call('coverage')['verification_record']['assurance'], 'ref_resolved')
+
+    def test_one_missing_path_makes_a_multi_path_reference_claimed(self):
+        self.record('logs/parser.txt; logs/missing.md')
+        self.assertEqual(self.call('coverage')['verification_record']['assurance'], 'claimed')
+
+    def test_reference_outside_the_project_is_claimed(self):
+        self.record('../../etc/hosts')
+        self.assertEqual(self.call('coverage')['verification_record']['assurance'], 'claimed')
+
+    def test_acknowledged_external_checks_raise_assurance(self):
+        self.record('CI run 1234')
+        record = self.call('coverage', '--acknowledge-external')['verification_record']
+        self.assertEqual(record['assurance'], 'externally_checked')
+        self.assertTrue(record['checks']['references']['verified'])
+
+
 class IndexFanoutTests(unittest.TestCase):
     def entries(self, root, count):
         import objectstore as obs

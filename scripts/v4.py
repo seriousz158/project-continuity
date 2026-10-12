@@ -391,12 +391,35 @@ def make_target_resolver(root, project_id, stub, budget=None):
     return resolve
 
 
-CHECK_ORDER = ("coverage", "baseline", "mapping", "integrity", "external")
+CHECK_ORDER = ("coverage", "baseline", "references", "mapping", "integrity", "external")
 
 # A handoff may only claim verification when these checks passed.  Integrity and
 # external checks are reported separately: they are never inferred from a
 # matching Git identity or from a successful unrelated check.
-MANDATORY_CHECKS = ("coverage", "baseline", "mapping")
+MANDATORY_CHECKS = ("coverage", "baseline", "references", "mapping")
+
+# How far an evidence reference was checked, weakest first.  A pass that only
+# names a pointer nobody resolved is "claimed": it can satisfy the completion
+# gate, but it is never reported as verified evidence.
+ASSURANCE_LEVELS = ("claimed", "ref_resolved", "ref_bound", "externally_checked")
+SELF_REPORTED_LIST_LIMIT = 20
+
+
+def assurance_rank(level):
+    return ASSURANCE_LEVELS.index(level) if level in ASSURANCE_LEVELS else 0
+
+
+def lowest_assurance(levels):
+    levels = list(levels)
+    return min(levels, key=assurance_rank) if levels else None
+
+
+def evidence_assurance(flags, evidence_id):
+    """The caller grades references (it owns the project root); unknown is claimed."""
+    flags = flags or {}
+    if flags.get("acknowledge_external"):
+        return "externally_checked"
+    return (flags.get("evidence_assurance") or {}).get(evidence_id, "claimed")
 
 
 def canonical(value) -> str:
@@ -491,6 +514,24 @@ def _baseline_check(rows, block=None):
     return {"checked": True, "state": state, "reason": reason,
             "applicable": True, "verified": False, "reasons": stale}
 
+def _references_check(rows, flags):
+    contributors = sorted({key for row in rows for key in row["contributors"]})
+    if not contributors:
+        return {"checked": False, "state": "not_applicable", "reason": "no_effective_pass",
+                "applicable": False, "verified": False, "assurance": None}
+    grades = {key: evidence_assurance(flags, key) for key in contributors}
+    lowest = lowest_assurance(grades.values())
+    self_reported = [key for key in contributors if grades[key] == "claimed"]
+    verified = not self_reported
+    return {"checked": True, "state": "resolved" if verified else "self_reported",
+            "reason": None if verified else "evidence_self_reported",
+            "applicable": True, "verified": verified, "assurance": lowest,
+            "self_reported": self_reported[:SELF_REPORTED_LIST_LIMIT],
+            "self_reported_total": len(self_reported),
+            "does_not_cover": "a resolved path proves that the pointer exists,"
+                              " not that its content passed"}
+
+
 def _mapping_check(state):
     migration = state["extensions"].get("migration") or {}
     pending = bool(isinstance(migration, dict) and migration.get("mapping_review_required"))
@@ -521,6 +562,7 @@ def _external_check(flags):
 def _verification_checks(state, view, rows, baseline, integrity, flags, block=None):
     return {"coverage": _coverage_check(rows),
             "baseline": _baseline_check(rows, block),
+            "references": _references_check(rows, flags),
             "mapping": _mapping_check(state),
             "integrity": _integrity_check(integrity),
             "external": _external_check(flags)}
@@ -566,9 +608,11 @@ def _verification_record(checks, complete=True):
                             + ("; not asserted: " + ", ".join(not_checked)
                                if not_checked else "")
                             if verified else "not verified: " + str(reason))}
+    references = checks.get("references") or {}
     return {"schema": "project-continuity/verification-record/v1", "verified": verified,
             "reason": reason, "complete": complete, "checks": checks,
             "required": required, "not_checked": not_checked,
+            "assurance": references.get("assurance"),
             "scope": scope, "basis": "read_only_local"}
 
 def _describe(row, position):
@@ -736,6 +780,8 @@ def coverage(state, project_id, task_id=None, limit=20, baseline=None, current_s
                               "baseline": item["baseline"],
                               "baseline_reason": item["baseline_reason"]}
                              for item in covering[:limit]],
+                "assurance": lowest_assurance(evidence_assurance(flags, key)
+                                              for key in row["contributors"]),
                 "evidence_total": len(covering), "truncated": len(covering) > limit,
                 "evidence_page": _page(limit, 0, len(covering))})
             rows.append(row)
