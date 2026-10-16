@@ -466,6 +466,13 @@ not false. Recent evidence is the last three by
 recorded timestamp, with insertion order breaking ties. Use `handoff` and
 `coverage` for the details; brief reduces stdout bytes, not integrity I/O.
 
+Mutation responses report an absent `writer` or `lease_until` as JSON `null`,
+not the string `"null"`. On an idempotent replay, `revision` is the original
+receipt revision; `current_revision` is the current document revision.
+The returned `writer` and `lease_until` describe the current lease, not the
+lease at the time of the original commit. Use those current fields when
+planning the next write; a replay does not reacquire or renew a lease.
+
 Record each round as evidence with `ref` pointing at the report. Extensions
 hold pointers, not report bodies, full result matrices or per-round logs.
 `capacity --extension-limit N` lists the largest user keys and their estimated

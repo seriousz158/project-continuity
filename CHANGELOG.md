@@ -20,10 +20,15 @@
 - CI definition expands to 12 OS/Python combinations including Python 3.14,
   running both unittest and pytest. Remote run status must be checked separately.
 
-### Fixed
+### Changed
 
 - Mutation responses now report an absent writer or lease as JSON `null`,
   consistently with status and operation replays (not the string `"null"`).
+  Scripts that compare `writer == "null"` or `lease_until == "null"` must
+  instead check for JSON `null`.
+
+### Fixed
+
 - Brief status includes `mapping_review_required` and `migration_required`;
   unresolved mapping review is null. Document `progress_summary.gap_count` as
   an alias for uncovered acceptance rows, not all project gaps.
