@@ -22,6 +22,14 @@
 
 ### Fixed
 
+- Mutation responses now report an absent writer or lease as JSON `null`,
+  consistently with status and operation replays (not the string `"null"`).
+- Brief status includes `mapping_review_required` and `migration_required`;
+  unresolved mapping review is null. Document `progress_summary.gap_count` as
+  an alias for uncovered acceptance rows, not all project gaps.
+- A validation time budget is exhausted at its deadline, including a zero
+  budget on a coarse clock. Re-enable the Windows budget and bundle round-trip
+  regressions instead of skipping known-defect paths.
 - Reject oversized ZIP containers before parsing and excessive entry counts
   before member checks; encrypted members produce a controlled error, not a
   traceback. Limits: 64 MiB and 16,384 entries (central-directory parsing itself

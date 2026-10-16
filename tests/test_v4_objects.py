@@ -385,19 +385,19 @@ class V4ObjectStoreTests(V4Case):
                                    str(revision), "--operation-id", "degraded",
                                    expect=None)[0], 2)
 
-    @unittest.skipIf(os.name == "nt",
-                     "known Windows defect: deep-validation budget does not "
-                     "exhaust on Windows (issue #1)")
     def test_deep_validation_budget_exhaustion_is_not_corruption(self):
         self.seed(evidence=[self.entry(["condition one", "condition two"])])
         self.to_v4()
         real_budget = obs.Budget
         with self.assertRaises(cli.RelayError) as caught:
             with mock.patch.object(obs, "Budget",
-                                   lambda *a, **k: real_budget(seconds=0.0)):
+                                   lambda *a, **k: real_budget(seconds=0.0)), \
+                    mock.patch.object(obs.time, "monotonic", return_value=100.0):
+                # A coarse clock may not tick between construction and consume.
                 relay_v4.resolve(self.current(), self.root)
         self.assertEqual(caught.exception.code, "RELAY_VALIDATION_BUDGET_EXCEEDED")
-        with mock.patch.object(obs, "Budget", lambda *a, **k: real_budget(seconds=0.0)):
+        with mock.patch.object(obs, "Budget", lambda *a, **k: real_budget(seconds=0.0)), \
+                mock.patch.object(obs.time, "monotonic", return_value=100.0):
             status = self.call("status")[1]
         self.assertEqual(status["objects_integrity"], "budget_exceeded")
         self.assertEqual(status["verification"], "unverified")
@@ -629,9 +629,6 @@ class V4SafetyTests(V4Case):
 
 
 class V4InteropTests(V4Case):
-    @unittest.skipIf(os.name == "nt",
-                     "known Windows defect: verify --bundle rejects a freshly "
-                     "exported bundle with 'invalid handoff bundle' (issue #1)")
     def test_export_bundle_carries_every_object_and_verifies(self):
         self.seed(evidence=[self.entry(["condition one", "condition two"])])
         self.to_v4()

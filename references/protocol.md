@@ -456,9 +456,13 @@ while CURRENT remains small. Transfer must then be planned explicitly.
 
 Start an existing relay with read-only `status --brief`; absence never authorizes
 `init`. The brief is a projection, not a completion gate. `progress_summary`
-is additive in full status: its gap count is the total uncovered acceptance
-rows (the same judgement as handoff), not a verification verdict. Counts are
-null when resolution is incomplete. Recent evidence is the last three by
+is additive in full status: `progress_summary.gap_count` is an alias for
+`uncovered_acceptance`, the total uncovered acceptance rows (the same judgement
+as handoff), not all project gaps or a verification verdict. It does not count
+blockers, drift, mapping review or integrity warnings. Counts are null when
+resolution is incomplete. Brief includes `mapping_review_required` and
+`migration_required`; the mapping flag is null if state could not be resolved,
+not false. Recent evidence is the last three by
 recorded timestamp, with insertion order breaking ties. Use `handoff` and
 `coverage` for the details; brief reduces stdout bytes, not integrity I/O.
 

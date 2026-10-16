@@ -78,7 +78,7 @@ class BriefTests(Case):
         before = (self.root / ".relay/CURRENT.md").read_bytes()
         full = self.call("status")
         brief = self.call("status", "--brief")
-        for key in ("revision", "schema", "status", "writer", "lease_until", "lease_active", "drift", "git_check_status", "verification", "write_ready", "progress_summary"):
+        for key in ("revision", "schema", "status", "writer", "lease_until", "lease_active", "drift", "git_check_status", "verification", "write_ready", "mapping_review_required", "migration_required", "progress_summary"):
             self.assertEqual(brief[key], full[key])
         summary = brief["progress_summary"]
         self.assertEqual(summary["current_task"], {"id": "t", "status": "todo"})
@@ -103,12 +103,53 @@ class BriefTests(Case):
             self.assertFalse(self.call("status", "--brief")["exists"])
             self.assertFalse((self.root / ".relay").exists())
 
+    def test_recent_evidence_handles_mixed_timezone_formats(self):
+        times = ["2026-10-17T10:00:00+10:00", "2026-10-17 01:00:00+00:00",
+                 "20261017T020000+0000", "2026-10-16T22:30:00.123456-04:00",
+                 "2026-10-17T02:30:00,123456Z"]
+        self.write("save", extra=("--acquire",), patch={
+            "tasks": [{"id": "t", "title": "mixed timestamps", "acceptance": ["ok"]}],
+            "evidence": [{"id": "time" + str(i), "task_id": "t", "check": "unit",
+                          "result": "not_run", "at": at, "ref": "r", "acceptance": []}
+                         for i, at in enumerate(times)]})
+        before = (self.root / ".relay/CURRENT.md").read_bytes()
+        for args in (("status",), ("status", "--brief")):
+            recent = self.call(*args)["progress_summary"]["recent_evidence"]
+            self.assertEqual([row["id"] for row in recent], ["time2", "time3", "time4"])
+        self.assertEqual((self.root / ".relay/CURRENT.md").read_bytes(), before)
+
+    def test_naive_evidence_timestamp_is_rejected_atomically(self):
+        before = (self.root / ".relay/CURRENT.md").read_bytes()
+        result = self.write("save", extra=("--acquire",), patch={
+            "tasks": [{"id": "t", "title": "naive timestamp", "acceptance": ["ok"]}],
+            "evidence": [{"id": "naive", "task_id": "t", "check": "unit",
+                          "result": "not_run", "at": "2026-10-17T01:00:00",
+                          "ref": "r", "acceptance": []}]}, expected=2)
+        self.assertIn("invalid timestamp", result["error"])
+        self.assertNotIn("Traceback", result["error"])
+        self.assertEqual((self.root / ".relay/CURRENT.md").read_bytes(), before)
+
+    def test_brief_exposes_mapping_and_migration_flags(self):
+        self.write("save", extra=("--acquire",),
+                   patch={"extensions": {"migration": {"mapping_review_required": True}}})
+        full = self.call("status")
+        before = (self.root / ".relay/CURRENT.md").read_bytes()
+        brief = self.call("status", "--brief")
+        self.assertTrue(brief["mapping_review_required"])
+        self.assertFalse(brief["migration_required"])
+        self.assertEqual(brief["verification"], "UNVERIFIED")
+        for key in ("mapping_review_required", "migration_required"):
+            self.assertEqual(brief[key], full[key])
+        self.assertEqual((self.root / ".relay/CURRENT.md").read_bytes(), before)
+
     def test_brief_degraded_counts_are_unknown_not_zero(self):
         current = self.root / ".relay/CURRENT.md"
         # A valid object reference with a missing object must not look gap-free.
         with mock.patch.object(cli, "_resolve_for_read", return_value=(None, cli.RelayError("RELAY_OBJECT_MISSING", "missing object"))):
             result = self.call("status", "--brief")
         self.assertIsNone(result["progress_summary"]["gap_count"])
+        self.assertIsNone(result["mapping_review_required"])
+        self.assertFalse(result["migration_required"])
         self.assertFalse(result["write_ready"])
 
 
@@ -139,6 +180,23 @@ class WarningTests(Case):
 
 
 class OperationTests(Case):
+    def test_write_and_replay_use_same_json_lease_types(self):
+        resumed = self.write()
+        self.assertEqual(resumed["writer"], "a")
+        self.assertIsInstance(resumed["lease_until"], str)
+        for first, replay in ((resumed, self.write()),
+                              (self.write("update", 1), self.write("update", 1))):
+            self.assertTrue(replay["replayed"])
+            for key in ("writer", "lease_until"):
+                self.assertEqual(first[key], replay[key])
+        for revision, extra in ((2, ()), (3, ("--acquire",))):
+            first = self.write("save", revision, extra=extra)
+            replay = self.write("save", revision, extra=extra)
+            self.assertTrue(replay["replayed"])
+            for result in (first, replay):
+                self.assertIsNone(result["writer"])
+                self.assertIsNone(result["lease_until"])
+
     def test_auto_resume_save_retry_and_current_revision(self):
         first = self.write()
         self.assertTrue(first["operation_id"].startswith("auto-"))
@@ -169,7 +227,7 @@ class OperationTests(Case):
     def test_acquire_is_one_revision_and_one_history_snapshot(self):
         result = self.write("save", extra=("--acquire",), patch={"project": {"next_step": "single"}})
         self.assertEqual(result["revision"], 1)
-        self.assertEqual(result["writer"], "null")
+        self.assertIsNone(result["writer"])
         status = self.call("status")
         self.assertIsNone(status["writer"])
         self.assertEqual(len(list((self.root / ".relay/history").iterdir())), 1)

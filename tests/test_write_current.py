@@ -66,6 +66,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(current.read_bytes(), before)
         self.call('validate')
 
+    def test_brief_legacy_migration_is_required(self):
+        relay = self.root / '.relay'
+        relay.mkdir()
+        current = relay / 'CURRENT.md'
+        current.write_text(V1, encoding='utf-8', newline='\n')
+        before = current.read_bytes()
+        brief = self.call('status', '--brief')
+        self.assertTrue(brief['migration_required'])
+        self.assertIsNone(brief['mapping_review_required'])
+        self.assertEqual(current.read_bytes(), before)
+
     def test_empty_explicit_project_id_does_not_initialize(self):
         self.call('init', '--schema', 'v2', '--project-id', '', ok=False)
         self.assertFalse((self.root / '.relay').exists())

@@ -2266,6 +2266,7 @@ def status(args, root):
               "archived_receipts": archive["archived"],
               "document_valid": bool(matches),
               "migration_required": meta["schema"] not in p.SUPPORTED_SCHEMAS,
+              "mapping_review_required": None,
               "requires_drift_review": block["check"]["state"] in (CHECK_STALE, CHECK_UNCHECKED),
               "git_check_status": observed["state"],
               "drift_check_status": block["check"]["state"],
@@ -2344,7 +2345,8 @@ def status(args, root):
         return {"brief": True, **{key: result[key] for key in (
             "exists", "schema", "revision", "status", "writer", "lease_until", "lease_active",
             "drift", "git_check_status", "drift_check_status", "verification", "write_ready",
-            "document_valid", "objects_integrity", "archive_integrity", "warnings", "progress_summary")}}
+            "document_valid", "objects_integrity", "archive_integrity", "mapping_review_required",
+            "migration_required", "warnings", "progress_summary")}}
     if args.command == "validate":
         p.require(matches, "derived view conflict")
         if archive["integrity"] == "invalid":
@@ -2764,8 +2766,10 @@ def mutate(args, root, dry_run=False):
             schema, before_bytes, final_bytes, committed=True,
             object_store_new_bytes=published["bytes_written"],
             archived_segments=len(segments), next_save_cycle=next_cycle)
-        return {**result, "revision": revision, "schema": schema, "writer": updates["writer"],
-                "lease_until": updates["lease_until"], "replayed": False, "operation_id": args.operation_id}
+        return {**result, "revision": revision, "schema": schema,
+                "writer": p.meta_value(updates["writer"]),
+                "lease_until": p.meta_value(updates["lease_until"]),
+                "replayed": False, "operation_id": args.operation_id}
 
 
 def parser():

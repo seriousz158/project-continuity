@@ -139,7 +139,7 @@ class Budget:
             raise RelayError(RELAY_VALIDATION_BUDGET_EXCEEDED, "object count budget exceeded")
         if self.bytes > self.max_bytes:
             raise RelayError(RELAY_VALIDATION_BUDGET_EXCEEDED, "logical byte budget exceeded")
-        if time.monotonic() > self.deadline:
+        if time.monotonic() >= self.deadline:
             raise RelayError(RELAY_VALIDATION_BUDGET_EXCEEDED, "validation time budget exceeded")
 
 
