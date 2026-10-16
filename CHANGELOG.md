@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0 - 2026-10-16
+
+### Added
+
+- `status --brief`: bounded progress counters, current task, lease/drift and
+  recent evidence; full status adds `progress_summary` without removing fields.
+- Stable automatic operation IDs for resume/update/save using the existing
+  receipt hash. Explicit IDs and old receipt fingerprints are unchanged.
+  Mutation responses include `operation_id`; replays include the current lease.
+- `save --acquire`: acquire, apply and release under one lock / one revision,
+  with the same drift and foreign-lease checks as resume.
+- `capacity --acquire` forecasts a single save; automatic IDs also work in
+  exact capacity forecasts. `--extension-limit` lists top user extension sizes,
+  exact-shape tombstones, dangling keys and a v6 archival patch (advisory only).
+- Existing-relay discovery and a smaller skill entrypoint; detailed invariants
+  remain in protocol.md. No implicit initialization or migration.
+- Metadata-only actionable revision, lease, change-field and acceptance errors.
+- CI definition expands to 12 OS/Python combinations including Python 3.14,
+  running both unittest and pytest. Remote run status must be checked separately.
+
+### Fixed
+
+- Reject oversized ZIP containers before parsing and excessive entry counts
+  before member checks; encrypted members produce a controlled error, not a
+  traceback. Limits: 64 MiB and 16,384 entries (central-directory parsing itself
+  is not a streaming memory bound).
+- Capacity-governance warnings only fire at the trigger or if compaction cannot
+  fit; messages name the current schema. History/tombstone hints remain read-only.
+
+No schema changes; v2-v6 remain readable. Distributed and cross-machine
+validation, release publication and installation are separate gates.
+
+
 ## 0.5.0 - 2026-10-11
 
 Capacity governance round: a lossless cold archive, explicit garbage

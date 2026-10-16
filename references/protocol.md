@@ -450,3 +450,61 @@ explicit way to drop old history and unreachable objects. There is no
 distributed locking. Export/verify use
 matching uncompressed budgets; a project can outgrow the bundle budget even
 while CURRENT remains small. Transfer must then be planned explicitly.
+
+
+## Lightweight reads and extension hygiene (v0.6)
+
+Start an existing relay with read-only `status --brief`; absence never authorizes
+`init`. The brief is a projection, not a completion gate. `progress_summary`
+is additive in full status: its gap count is the total uncovered acceptance
+rows (the same judgement as handoff), not a verification verdict. Counts are
+null when resolution is incomplete. Recent evidence is the last three by
+recorded timestamp, with insertion order breaking ties. Use `handoff` and
+`coverage` for the details; brief reduces stdout bytes, not integrity I/O.
+
+Record each round as evidence with `ref` pointing at the report. Extensions
+hold pointers, not report bodies, full result matrices or per-round logs.
+`capacity --extension-limit N` lists the largest user keys and their estimated
+serialized entry bytes (not an exact post-archive saving). Tombstones have
+exactly `archived: true` (boolean) and a nonempty string `archive_ref`.
+Managed namespaces and referenced target keys are excluded. Keep the reported
+`preserve_keys`, including aggregate archive pointers. A dangling reference is
+still a tombstone, not proof that the original payload can be recovered.
+
+On v6 the suggested `{"extensions":{"key":null}}` patch moves the existing
+value to the cold archive; inspect/confirm it before applying. v2-v5 need an
+explicit migration first: null is not archival there. Archiving a tombstone
+preserves only that marker. External manifest contents, paths and integrity
+remain separately unverified. No hint performs a write or garbage collection.
+Status only hints at tombstones when their entries total at least 1 KiB or the
+document exceeds its trigger. A history count over twice the default retention
+suggests a read-only `gc` preview, never automatic deletion.
+
+
+## Detailed integrity and relationship invariants
+
+- Relationship identity is `(record_type, record_id)`; a correction is immutable and may not revoke another correction. A manifest correction target is accepted only after the object is resolved and verified under an explicit project root; ambiguous manifest names are refused by name.
+
+- Receipt archives are content-addressed and local under `.relay/receipts/`; only
+  the chain reachable from `CURRENT.md` is committed history. Missing or
+  corrupted archives permit read-only inspection but block mutations.
+
+- v4 evidence lives in content-addressed objects under `.relay/objects/`, a
+  v5 document additionally externalises its custom Markdown sections and its
+  acceptance map the same way, and a v6 document keeps its cold archive there
+  too (each archived record verbatim; archiving never deletes).  Resolve them only with
+  `resolve(document_text, project_root)`; an explicit project root is
+  mandatory, an envelope is never a completed state, a missing object is named
+  corruption (read-only degraded), and an exhausted deep check is an
+  incomplete check that can never be reported as PASS.  `--verify-integrity`
+  is the explicit deep check: it reads every reachable object and index node,
+  names every failure, and refuses to report a document whose custom Markdown
+  stub, acceptance map or object digests disagree with the bound bytes.
+
+- Verification frequency (2026-10-04, ADR-T004-007): `--verify-integrity` and digest
+  recomputation are boundary operations, not per-write rituals. Run the deep check at
+  handoff boundaries — export/import, cross-agent or cross-machine transfer, migration,
+  recovery, a suspected disagreement — and when the user or project explicitly asks. Do not
+  re-verify the same content twice in one session, and do not paste hash lists into reports
+  or into `CURRENT.md`: a re-hash of content the same agent just wrote is not independent
+  evidence.

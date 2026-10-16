@@ -10,7 +10,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 ARCHIVE_ROOT = "project-continuity"
 FILES = (
     ".gitignore",
@@ -56,6 +56,7 @@ FILES = (
     "tests/test_security_regressions.py",
     "tests/test_storage.py",
     "tests/test_v05_fixes.py",
+    "tests/test_v060.py",
     "tests/test_v4_objects.py",
     "tests/test_v6_archive.py",
     "tests/test_write_current.py",

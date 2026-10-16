@@ -77,7 +77,7 @@ flowchart LR
     B --> C
 ```
 
-1. **检查**：`status` 与 `validate` 完全只读，不会隐式初始化项目。
+1. **检查**：`status --brief` 与 `validate` 完全只读，不会隐式初始化项目。
 2. **接棒**：Agent 核对 Git 漂移，并使用实际 revision 取得 writer lease。
 3. **更新**：按稳定 ID 提交结构化变更，revision 增加但 lease 保留。
 4. **保存**：先归档旧 revision，再原子提交新状态并释放 lease。容量治理在同一锁内完成后才替换当前文件。
@@ -210,7 +210,7 @@ Git 指纹最多读取 256 MiB tracked 工作区内容；遇到不支持的链�
 
 Skill 遵循开放的 [`SKILL.md` Agent Skills 规范](https://agentskills.io/specification)，面向 Codex、Claude Code、Kimi Code、ZCode、OpenCode 以及其他能够发现 Agent Skills 或仓库指令的客户端。不同客户端的发现路径和重新加载行为不同，因此格式校验、客户端发现、脚本调用和真实跨会话行为必须分层验证。
 
-CLI 支持 macOS、Linux、Windows，以及 Python 3.11、3.12、3.13。GitHub Actions 会运行全部九种 OS/Python 组合。
+CLI 支持 macOS、Linux、Windows，以及 Python 3.11、3.12、3.13、3.14。GitHub Actions 会运行全部十二种 OS/Python 组合。
 
 ## 安装
 
@@ -226,15 +226,15 @@ python scripts/write_current.py --help
 
 ## 验证情况
 
-`v0.5.0` 包含 252 项测试，覆盖 v6 冷归档及其无损迁移、回执分批、垃圾回收、证据分级、历史重试、存储故障注入和干净发行包运行。
+`v0.6.0` 包含 287 项测试，覆盖 v6 冷归档及其无损迁移、回执分批、垃圾回收、证据分级、历史重试、存储故障注入和干净发行包运行。
 [CI 矩阵](https://github.com/seriousz158/project-continuity/actions/workflows/ci.yml)
-覆盖 macOS、Linux、Windows × Python 3.11–3.13；具体提交的结果见 Release Notes。
+覆盖 macOS、Linux、Windows × Python 3.11–3.14；具体提交的结果见 Release Notes。
 私有历史快照容量演练保留了项目记录与自定义正文，没有应用待处理业务补丁，也不代表真实项目切换。
 客户端发现、脚本运行和实际模型会话加载分别验收，不相互替代。
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.5.0.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.6.0.zip
 ```
 
 确定性打包器只包含 allowlist 文件，同时生成 SHA-256 sidecar；如果压缩包或校验文件已存在，它会拒绝覆盖。
@@ -256,3 +256,16 @@ python scripts/package_skill.py /tmp/project-continuity-v0.5.0.zip
 - 许可证：[MIT](LICENSE)
 
 Copyright (c) 2026 seriousz158。[NOTICE](NOTICE) 保留了受 `liu676767/codex-project-checkpoint-memory` 影响部分的适用署名。
+
+
+## v0.6 低成本会话
+
+开局用 `status --brief`；单处修改可用 `save --acquire --writer <id>
+--expected-revision <n> --input change.json`，获取与释放租约只提交一个 revision。
+`capacity --acquire` 可以只读预览同样的单次保存。
+resume/update/save 未提供 operation-id 时复用现有回执指纹生成稳定 ID；
+显式 ID 优先，重试须保持全部参数相同。后续写入复用返回 revision；
+回放使用 current_revision，不能使用历史回执 revision。其他写入的显式 ID
+要求不变。brief 只减少输出量，不减少完整性读取，也不替代完成门禁。
+容量、墓碑和历史提示从不自动归档或删除。客户端自动发现尚需单独实测；
+12 个 CI job 是配置目标，不代表未推送的版本已经远端通过。

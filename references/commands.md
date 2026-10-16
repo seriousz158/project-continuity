@@ -131,8 +131,9 @@ Use `--no-auto-compact` on `resume`, `update`, or `save` for a single write when
 you need the pre-v3 fail-closed behavior. It never truncates project data; a
 candidate that still exceeds 64 KiB is rejected.
 
-Every successful mutating operation advances the revision. Re-read status
-before the next mutation. Do not reuse an operation ID for different input.
+Every new mutating operation advances the revision; replay does not. Reuse the
+returned revision (current_revision on replay) for the next mutation. Do not
+reuse an explicit operation ID for different input.
 Input files whose path or ancestors are symbolic links are rejected; use
 reviewed standard input when a trusted regular file path is unavailable.
 
@@ -246,3 +247,32 @@ found (reported per record collection); 2 means the documents could not be
 compared.  Only the schema, storage references, managed metadata, revision,
 timestamps, lease and this operation receipt may differ; business fields are
 never on an ignore list.
+
+
+## v0.6 convenience parameters
+
+```bash
+python scripts/write_current.py status --brief --root <project>
+python scripts/write_current.py save --acquire --root <project> \
+  --writer <writer-id> --expected-revision <n> --input change.json
+python scripts/write_current.py capacity --acquire --root <project> \
+  --writer <writer-id> --expected-revision <n> --input change.json
+python scripts/write_current.py capacity --extension-limit 10 --root <project>
+```
+
+Only resume/update/save permit omitted operation IDs; the existing canonical
+receipt hash supplies `auto-` plus 24 hex characters. It covers command, writer,
+expected revision, normalized input and semantic flags (including acquire).
+It is a 96-bit prefix, not a mathematical collision-free identity. The full
+hash is still checked for receipt reuse; a collision fails closed. Explicit IDs
+retain precedence and legacy explicit receipts remain replayable. Keep all
+retry arguments unchanged. After a replay use current_revision and the returned
+current writer/lease, not the old receipt revision.
+
+`save --acquire` accepts absent/expired or own live leases, refuses live foreign
+leases, reviews Git drift exactly as resume does, and releases the lease in one
+commit. Default save still requires an owned live lease. `capacity --acquire`
+models this one commit, not a resume/save cycle. Capacity with writer and
+expected revision can derive the exact next resume ID without --operation-id.
+Normal defaults and all prior field meanings are preserved; full status adds
+progress_summary, and mutation responses add operation_id/current replay lease.

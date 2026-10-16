@@ -263,6 +263,66 @@ class CapacityTests(unittest.TestCase):
                 archive.writestr(name, value)
         self.assertEqual(self.call("verify", "--bundle", str(bad))[0], 2)
 
+    def test_bundle_rejects_entry_count_before_member_validation(self):
+        import zipfile
+        from unittest.mock import patch
+        bundle = self.root / "too-many.zip"
+        with zipfile.ZipFile(bundle, "w") as archive:
+            for name in ("CURRENT.md", "MANIFEST.json", "unexpected"):
+                archive.writestr(name, "x")
+        with patch.object(cli, "BUNDLE_MAX_ENTRIES", 2, create=True):
+            code, _, error = self.call("verify", "--bundle", str(bundle))
+        self.assertEqual(code, 2)
+        self.assertIn("bundle exceeds entry budget", error)
+        output = self.root / "over-budget-export.zip"
+        with patch.object(cli, "BUNDLE_MAX_ENTRIES", 1):
+            code, _, error = self.call("export", "--output", str(output))
+        self.assertEqual(code, 2)
+        self.assertIn("entry budget", error)
+        self.assertFalse(output.exists())
+
+    def test_bundle_rejects_encrypted_entry_without_traceback(self):
+        """Encrypted ZIP members are hostile input, not a CLI crash path."""
+        import zipfile
+
+        bundle = self.root / "encrypted.zip"
+        with zipfile.ZipFile(bundle, "w") as archive:
+            archive.writestr("CURRENT.md", b"")
+            archive.writestr("MANIFEST.json", b"{}")
+
+        # Python's stdlib writer cannot encrypt, so set the general-purpose
+        # encrypted flag in both local and central directory headers.
+        payload = bytearray(bundle.read_bytes())
+        offset = 0
+        while True:
+            offset = payload.find(b"PK\x03\x04", offset)
+            if offset < 0:
+                break
+            payload[offset + 6:offset + 8] = (1).to_bytes(2, "little")
+            offset += 4
+        offset = 0
+        while True:
+            offset = payload.find(b"PK\x01\x02", offset)
+            if offset < 0:
+                break
+            payload[offset + 8:offset + 10] = (1).to_bytes(2, "little")
+            offset += 4
+        bundle.write_bytes(payload)
+
+        code, _result, error = self.call("verify", "--bundle", str(bundle))
+        self.assertEqual(code, 2)
+        self.assertIn("invalid handoff bundle", error)
+        self.assertNotIn("Traceback", error)
+
+    def test_bundle_rejects_oversized_container_before_parsing(self):
+        bundle = self.root / "oversized.zip"
+        with bundle.open("wb") as handle:
+            handle.truncate(cli.BUNDLE_MAX_BYTES + 1)
+
+        code, _result, error = self.call("verify", "--bundle", str(bundle))
+        self.assertEqual(code, 2)
+        self.assertIn("bundle exceeds size budget", error)
+
 
 if __name__ == "__main__":
     unittest.main()

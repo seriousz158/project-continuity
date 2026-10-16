@@ -88,7 +88,7 @@ flowchart LR
     B --> C
 ```
 
-1. **Inspect** — `status` and `validate` are read-only and never initialize a
+1. **Inspect** — `status --brief` and `validate` are read-only and never initialize a
    project.
 2. **Resume** — the agent reviews Git drift and acquires the writer lease using
    the observed revision.
@@ -264,8 +264,8 @@ Skills or repository instructions. Discovery paths and reload behavior vary by
 client, so installation, discovery, script invocation, and real cross-session
 behavior must be verified separately.
 
-The CLI supports macOS, Linux, and Windows on Python 3.11, 3.12, and 3.13.
-GitHub Actions runs all nine OS/Python combinations.
+The CLI supports macOS, Linux, and Windows on Python 3.11, 3.12, 3.13, and 3.14.
+GitHub Actions runs all twelve OS/Python combinations.
 
 ## Installation
 
@@ -287,11 +287,11 @@ from the installed directory.
 
 ## Verification
 
-The `v0.5.0` suite covers 252 tests, including the v6 cold archive and its
+The `v0.6.0` suite covers 287 tests, including the v6 cold archive and its
 lossless migration, receipt batching, garbage collection, evidence assurance,
 archived retries, injected storage failures, and clean package execution.
 The [CI matrix](https://github.com/seriousz158/project-continuity/actions/workflows/ci.yml)
-covers macOS, Linux and Windows on Python 3.11–3.13. See the release notes for
+covers macOS, Linux and Windows on Python 3.11–3.14. See the release notes for
 commit-specific results. A private historical-snapshot capacity rehearsal
 preserved project records and custom Markdown; it did not apply pending
 business changes or authorize live project cutover. Client discovery, script
@@ -299,7 +299,7 @@ execution and actual model-session reload are separate verification levels.
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py /tmp/project-continuity-v0.5.0.zip
+python scripts/package_skill.py /tmp/project-continuity-v0.6.0.zip
 ```
 
 The deterministic packager includes only its allowlisted source files and produces a
@@ -323,3 +323,23 @@ SHA-256 sidecar. It refuses to overwrite an existing archive or checksum.
 
 Copyright (c) 2026 seriousz158. [NOTICE](NOTICE) preserves applicable attribution
 for portions influenced by `liu676767/codex-project-checkpoint-memory`.
+
+
+## v0.6 low-cost sessions
+
+```bash
+python scripts/write_current.py status --brief --root <project>
+python scripts/write_current.py save --acquire --root <project> \
+  --writer <writer-id> --expected-revision <n> --input change.json
+python scripts/write_current.py capacity --acquire --root <project> \
+  --writer <writer-id> --expected-revision <n> --input change.json
+```
+
+Resume/update/save derive an automatic operation ID when omitted. Retry with
+exactly the same inputs; explicit IDs still win. Reuse the returned revision
+(and current_revision on replay), rather than rereading status after each write.
+Other mutating commands still require explicit operation IDs where applicable.
+Brief reduces output, not integrity I/O; it cannot replace completion gates.
+Capacity extension/tombstone hints never archive or delete anything. Existing
+relay discovery does not prove automatic loading in every client. The 12-job CI
+matrix is a configured target, not a claim that an unpublished build passed it.

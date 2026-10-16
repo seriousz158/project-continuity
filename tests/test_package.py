@@ -16,6 +16,23 @@ import package_skill
 
 
 class PackageTests(unittest.TestCase):
+    def test_skill_is_small_and_preserves_all_command_routes(self):
+        import cli_v2
+        import argparse
+        skill = (ROOT / "SKILL.md").read_bytes()
+        self.assertLessEqual(len(skill), 5120)
+        routes = next(action for action in cli_v2.parser()._actions
+                      if isinstance(action, argparse._SubParsersAction)).choices
+        for command in routes:
+            self.assertIn("`" + command + "`", skill.decode("utf-8"))
+
+    def test_existing_relay_discovery_is_read_only(self):
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        description = skill.split("---", 2)[1]
+        self.assertIn("or the project already contains `.relay/CURRENT.md`", description)
+        self.assertIn("status --brief", skill)
+        self.assertIn("Never initialize implicitly", skill)
+
     def test_archive_is_allowlisted_reproducible_and_runnable(self):
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
@@ -72,6 +89,17 @@ class PackageTests(unittest.TestCase):
                 (extracted / name).read_text(encoding="utf-8")
                 for name in package_skill.FILES
             ))
+
+    def test_v060_version_matrix_and_allowlist(self):
+        self.assertEqual(package_skill.VERSION, "0.6.0")
+        self.assertIn("tests/test_v060.py", package_skill.FILES)
+        ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn('"3.14"', ci)
+        self.assertIn("python -m pytest", ci)
+        self.assertIn("v0.6.0.zip", ci)
+        self.assertIn("all twelve OS/Python combinations", (ROOT / "README.md").read_text(encoding="utf-8"))
+        for name in ("README.md", "README.zh-CN.md", "CHANGELOG.md"):
+            self.assertIn("0.6.0", (ROOT / name).read_text(encoding="utf-8"))
 
     def test_refuses_existing_destination_or_sidecar(self):
         with tempfile.TemporaryDirectory() as raw:

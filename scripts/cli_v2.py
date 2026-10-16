@@ -44,6 +44,7 @@ SECRET = re.compile(
 ARCHIVE_DIR = "receipts"
 ARCHIVE_SUFFIX = ".jsonl"
 BUNDLE_MAX_BYTES = 64 * 1024 * 1024
+BUNDLE_MAX_ENTRIES = 16_384
 
 
 def now():
@@ -649,6 +650,7 @@ def _bundle_payload(root):
                 "receipts": names, "objects": objects}
     files["MANIFEST.json"] = json.dumps(manifest, ensure_ascii=False, sort_keys=True,
                                         separators=(",", ":")) + "\n"
+    p.require(len(files) <= BUNDLE_MAX_ENTRIES, "handoff bundle exceeds entry budget")
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name in sorted(files):
@@ -710,9 +712,16 @@ def verify_bundle(args, root):
     path = Path(args.bundle).expanduser().absolute()
     info = fs._check(path, missing=False)
     fs._validate(info)
+    # Bound the container itself before asking ``zipfile`` to enumerate its
+    # central directory.  The normal exporter already enforces this size, so a
+    # larger input can only be an invalid or hostile handoff bundle; rejecting
+    # it here avoids unbounded metadata parsing before entry budgets apply.
+    p.require(info.st_size <= BUNDLE_MAX_BYTES, "bundle exceeds size budget")
     try:
         with zipfile.ZipFile(path, "r") as archive:
             names = archive.namelist()
+            if len(names) > BUNDLE_MAX_ENTRIES:
+                raise fs.Error("bundle exceeds entry budget")
             p.require(len(names) == len(set(names)), "duplicate bundle entry")
             p.require("CURRENT.md" in names and "MANIFEST.json" in names, "bundle manifest is incomplete")
             total_size = 0
@@ -760,7 +769,13 @@ def verify_bundle(args, root):
             current = archive.read("CURRENT.md").decode("utf-8")
             p.require(hashlib.sha256(current.encode("utf-8")).hexdigest() == manifest["current_sha256"],
                       "bundle current checksum mismatch")
-    except (KeyError, OSError, UnicodeError, ValueError, zipfile.BadZipFile) as exc:
+    except fs.Error:
+        raise
+    # ``ZipFile.read`` can raise ``RuntimeError`` for encrypted entries (and
+    # unsupported compression methods).  A handoff bundle is untrusted input;
+    # do not let that parser exception escape as a traceback from the CLI.
+    except (KeyError, OSError, UnicodeError, ValueError, RuntimeError,
+            zipfile.BadZipFile) as exc:
         raise fs.Error("invalid handoff bundle") from exc
     # Reuse the normal parser and archive-chain validator in an isolated,
     # throwaway directory; nothing from a bundle is written to the project.
@@ -845,7 +860,7 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
         # A save releases the lease: the writer and its deadline are cleared,
         # and an active project is parked.  Modelling it as a renewed resume
         # would predict bytes the commit never writes.
-        if status == "active":
+        if status == "active" and "status" not in (patch or {}).get("project", {}):
             status = "paused"
         updates = {"schema": meta["schema"], "revision": str(revision),
                    "updated_at": iso(stamp), "writer": "null",
@@ -1330,7 +1345,13 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
     schema = meta["schema"]
     limit, _trigger, _target = p.budget(schema)
     writer = getattr(args, "writer", None) or "preview-writer"
-    lease_minutes = getattr(args, "lease_minutes", None) or 30
+    lease_minutes = getattr(args, "lease_minutes", None)
+    lease_minutes = 30 if lease_minutes is None else lease_minutes
+    p.require(0 < lease_minutes <= 1440, "lease must be 1 to 1440 minutes")
+    p.identifier(writer)
+    if getattr(args, "expected_revision", None) is not None:
+        p.require(args.expected_revision == int(meta["revision"]),
+                  f"revision conflict; current_revision={meta['revision']}")
     operation_id = getattr(args, "operation_id", None)
     full = copy.deepcopy(stub)
     resolver = relay_v4.make_target_resolver(root, meta["project_id"], stub)
@@ -1358,7 +1379,36 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
         raise RelayError(RELAY_PREVIEW_LEASE_CONFLICT,
                          "another writer holds a live lease; no commit can be predicted")
     is_prune = isinstance(apply_patch, dict) and "prune" in apply_patch
-    if active:
+    acquire = bool(getattr(args, "acquire", False))
+    if acquire:
+        p.require(not is_prune, "--acquire previews save, not prune")
+        p.require(getattr(args, "expected_revision", None) == revision,
+                  f"revision conflict; current_revision={revision}")
+        old_git = baseline(meta)
+        if old_git != git:
+            p.require(getattr(args, "allow_drift", False), "Git drift detected; review before --allow-drift")
+    if (active or acquire) and not is_prune and (operation_id is None) and getattr(args, "writer", None) is not None and getattr(args, "expected_revision", None) is not None:
+        identity_args = argparse.Namespace(**vars(args))
+        identity_args.command = "save"
+        operation_id, _hash = _operation_identity(identity_args, patch)
+    def forecast_id(command, expected_revision, command_patch, fallback):
+        if operation_id is not None or getattr(args, "writer", None) is None or getattr(args, "expected_revision", None) is None:
+            return fallback
+        identity_args = argparse.Namespace(**vars(args))
+        identity_args.command = command
+        identity_args.expected_revision = expected_revision
+        return _operation_identity(identity_args, command_patch)[0]
+
+    if acquire:
+        if full["project"]["status"] == "paused":
+            full["project"]["status"] = "active"
+        model = _commit_model(meta, lines, body, full, "save", revision + 1,
+                              operation_id or "preview-save", writer, lease_minutes, stamp,
+                              patch=apply_patch, git=git, targets=resolver,
+                              markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
+                              root=root)
+        steps, mode, commands = [model], "save-acquire", ["save"]
+    elif active:
         if is_prune:
             update = _commit_model(meta, lines, body, full, "update", revision + 1,
                                    operation_id or "preview-prune", writer, lease_minutes, stamp,
@@ -1379,7 +1429,8 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
                                   root=root)
             steps, mode, commands = [model], "save", ["save"]
     else:
-        resume_op = (operation_id + "-resume") if operation_id else "preview-resume"
+        resume_op = ((operation_id + "-resume") if operation_id else
+                     forecast_id("resume", revision, {}, "preview-resume"))
         first = _commit_model(meta, lines, body, full, "resume", revision + 1, resume_op,
                               writer, lease_minutes, stamp, git=git, targets=resolver,
                               root=root)
@@ -1390,7 +1441,8 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
                                    git=git, targets=resolver,
                                    markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
                                    root=root)
-            save_op = (operation_id + "-save") if operation_id else "preview-save"
+            save_op = ((operation_id + "-save") if operation_id else
+                       forecast_id("save", revision + 2, {}, "preview-save"))
             save = _commit_model(meta, lines, body, update["state"], "save", revision + 3,
                                  save_op, writer, lease_minutes, stamp, git=git,
                                  targets=resolver,
@@ -1398,7 +1450,8 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
                                  root=root)
             steps, mode, commands = [first, update, save], "cycle", ["resume", "update", "save"]
         else:
-            save_op = (operation_id + "-save") if operation_id else "preview-save"
+            save_op = ((operation_id + "-save") if operation_id else
+                       forecast_id("save", revision + 1, patch, "preview-save"))
             second = _commit_model(meta, lines, body, first["state"], "save", revision + 2,
                                    save_op, writer, lease_minutes, stamp, patch=apply_patch,
                                    git=git, targets=resolver,
@@ -1473,13 +1526,15 @@ def capacity_view(args, root):
         threshold = LONG_RECORD_HINT_BYTES
     if stub is not None:
         result["long_records"] = _long_record_hints(stub, threshold)
-    patch = input_patch(args) if getattr(args, "input", None) else None
+        extension_limit = getattr(args, "extension_limit", 10)
+        p.require(1 <= extension_limit <= 100, "--extension-limit must be 1 to 100")
+        result["extensions"] = _extension_governance(stub, meta["schema"], extension_limit)
+    patch = input_patch(args) if getattr(args, "input", None) else ({} if getattr(args, "acquire", False) else None)
     if patch is not None:
         p.require(stub is not None, "v1 is read-only; migrate before previewing a patch")
         result["patch_preview"] = _patch_preview(root, args, lines, body, meta, stub, patch)
     if patch is None and all(value is not None for value in (getattr(args, "writer", None),
-                                                             getattr(args, "expected_revision", None),
-                                                             getattr(args, "operation_id", None))):
+                                                             getattr(args, "expected_revision", None))):
         # Model the realistic next write (a resume) so that the predicted byte
         # count is the one the commit will actually produce.  The dry run runs the
         # same planning code as the commit, so with identical arguments the two
@@ -1487,20 +1542,22 @@ def capacity_view(args, root):
         preview_args = argparse.Namespace(**vars(args))
         preview_args.command = "resume"
         preview_args.input = None
-        preview_args.allow_drift = False
         preview_args.no_auto_compact = False
         preview = mutate(preview_args, root, dry_run=True)
-        model = {"operation_id": getattr(args, "operation_id", None),
+        replayed = bool(preview.get("replayed"))
+        candidate_revision = int(meta["revision"]) if replayed else int(meta["revision"]) + 1
+        model = {"operation_id": preview["operation_id"],
                  "writer": getattr(args, "writer", None),
                  "lease_minutes": getattr(args, "lease_minutes", None),
-                 "revision": int(meta["revision"]) + 1,
-                 "revision_digits": len(str(int(meta["revision"]) + 1)),
-                 "operation_receipt_bytes": _receipt_bytes(getattr(args, "operation_id", None),
-                                                           int(meta["revision"]) + 1)}
+                 "revision": candidate_revision,
+                 "revision_digits": len(str(candidate_revision)),
+                 "operation_receipt_bytes": (0 if replayed else _receipt_bytes(
+                     preview["operation_id"], candidate_revision))}
         result["next_commit"] = {"estimate_only": False,
                                  "excludes_new_operation_metadata": False,
                                  "modelled": False, "models": "resume",
-                                 "candidate_bytes": preview["candidate_bytes"],
+                                 "candidate_bytes": preview.get("candidate_bytes", size),
+                                 "replayed": replayed,
                                  "ungoverned_candidate_bytes":
                                      preview.get("ungoverned_candidate_bytes"),
                                  "schema": preview.get("schema"),
@@ -1508,7 +1565,7 @@ def capacity_view(args, root):
                                  "would_compact": bool(preview.get("archived_segments")),
                                  "archived_segments": preview.get("archived_segments"),
                                  "model": model,
-                                 "would_fit": preview.get("would_fit", False)}
+                                 "would_fit": preview.get("would_fit", size <= limit if replayed else False)}
     elif stub is None:
         result["next_commit"] = {"estimate_only": True, "unavailable": "v1 is read-only",
                                  "excludes_new_operation_metadata": True,
@@ -1980,9 +2037,9 @@ def gc(args, root):
         meta = plan["meta"]
         p.require(meta["schema"] in p.SUPPORTED_SCHEMAS,
                   "v1 is read-only; migrate before collecting garbage")
-        p.require(int(meta["revision"]) == args.expected_revision, "revision conflict")
+        p.require(int(meta["revision"]) == args.expected_revision, f"revision conflict; current_revision={meta['revision']}")
         p.require(meta["writer"] == args.writer and lease_active(meta),
-                  "missing, expired or conflicting lease; resume first")
+                  f"missing, expired or conflicting lease; resume first; writer={meta['writer']}; lease_until={meta['lease_until']}")
         history = fs.child(root, ".relay", "history")
         for _revision, name, _size in plan["expired"]:
             fs.remove(fs.child(history, name, exists=True))
@@ -2087,6 +2144,59 @@ def _resolve_for_read(root, meta, stub, budget=None):
         return stub, exc
     except (p.Invalid, fs.Error, OSError, UnicodeError, ValueError) as exc:
         return stub, RelayError(RELAY_OBJECT_SCHEMA_INVALID, "v4 state could not be resolved")
+
+
+def _extension_governance(state, schema, limit=10):
+    """Advisory metadata only; no values, files or archive targets are changed."""
+    extensions = state.get("extensions", {})
+    users = {key: value for key, value in extensions.items()
+             if key not in p.MANAGED_EXTENSIONS and not key.startswith("migration")}
+    shaped = {key: value for key, value in extensions.items()
+              if isinstance(value, dict) and set(value) == {"archived", "archive_ref"}
+              and value["archived"] is True and isinstance(value["archive_ref"], str)
+              and bool(value["archive_ref"].strip())}
+    referenced = {value["archive_ref"] for value in shaped.values()}
+    candidates = sorted(key for key in shaped if key in users and key not in referenced)
+    sizes = {key: len(json.dumps({key: value}, ensure_ascii=False).encode("utf-8"))
+             for key, value in users.items()}
+    result = {"largest": [{"key": key, "bytes": size} for key, size in
+                           sorted(sizes.items(), key=lambda item: (-item[1], item[0]))[:limit]],
+              "tombstones": {"count": len(candidates), "bytes": sum(sizes[key] for key in candidates),
+                             "keys": candidates,
+                             "dangling_keys": [key for key in candidates
+                                               if shaped[key]["archive_ref"] not in extensions]},
+              "preserve_keys": sorted(referenced & set(extensions)),
+              "read_only": True,
+              "note": "Keep referenced target keys; cold archive preserves only the tombstone, not external manifest contents."}
+    if schema in p.ARCHIVE_SCHEMAS:
+        result["archive_patch"] = {"extensions": {key: None for key in candidates}}
+    else:
+        result["recommendation"] = "migrate --to-latest before archiving extension keys; null is not archival on this schema"
+    return result
+
+
+def _progress_summary(state, baseline):
+    """Counters share the completion/coverage judgement, never a new gate."""
+    result = {"current_task": None, "current_task_uncovered": None,
+              "uncovered_acceptance": None, "gap_count": None,
+              "recent_evidence": [], "handoff_hint": "handoff (coverage and integrity details; brief is not a completion gate)"}
+    if state is None:
+        return result
+    view = p.evidence_view(state, baseline)
+    current_id = state["project"]["current_task"]
+    uncovered = 0
+    for task in state["tasks"]:
+        count = sum(not row["covered"] for row in p.acceptance_coverage(state, task, view=view))
+        uncovered += count
+        if task["id"] == current_id:
+            result["current_task"] = {"id": task["id"], "status": task["status"]}
+            result["current_task_uncovered"] = count
+    result["uncovered_acceptance"] = uncovered
+    # A gap is an uncovered acceptance row, as in handoff.unverified.
+    result["gap_count"] = uncovered
+    records = sorted(enumerate(state["evidence"]), key=lambda pair: (datetime.fromisoformat(pair[1]["at"].replace("Z", "+00:00")), pair[0]))
+    result["recent_evidence"] = [{"id": e["id"], "result": e["result"]} for _, e in records[-3:]]
+    return result
 
 
 def status(args, root):
@@ -2198,11 +2308,14 @@ def status(args, root):
         result["receipts"].update({"reclaimable_bytes": max(0, size - projected),
                                    "projected_bytes": projected,
                                    "planned_segments": len(planned)})
-        result["compact_recommended"] = bool(size >= trigger or planned)
+        result["compact_recommended"] = bool(size >= trigger or projected > limit)
         result["compact_fits"] = projected <= limit
         result["write_ready"] = result["write_ready"] and result["compact_fits"]
         if result["compact_recommended"]:
-            result["warnings"].append("capacity governance recommended; v2 requires explicit migration, v3/v4 govern eligible writes")
+            result["warnings"].append(
+                "capacity governance recommended; " + meta["schema"] +
+                (" requires explicit migration" if meta["schema"] == p.SCHEMA_V2
+                 else " governs eligible writes automatically"))
         if not result["compact_fits"]:
             result["warnings"].append("receipt compaction cannot fit the current business content under the document limit")
         migration_info = state["extensions"].get("migration", {})
@@ -2212,6 +2325,26 @@ def status(args, root):
             result["verification"] = "UNVERIFIED"
     elif stub is None:
         result["migration_required"] = True
+    history = fs.child(root, ".relay", "history")
+    if history.is_dir() and not history.is_symlink():
+        snapshots = sum(1 for item in history.iterdir() if re.fullmatch(r"r[0-9]+-[0-9a-f]{64}\.md", item.name)
+                        and item.is_file() and not item.is_symlink())
+        if snapshots > 2 * GC_KEEP_HISTORY:
+            result["warnings"].append("history exceeds twice the default retention; run gc for a read-only preview")
+    if resolved:
+        governance = _extension_governance(state, meta["schema"])
+        tombstones = governance["tombstones"]
+        if tombstones["count"] and (tombstones["bytes"] >= 1024 or size > trigger):
+            result["warnings"].append(
+                'extensions tombstones can be archived with {"key": null}; inspect capacity and preserve referenced targets'
+                if meta["schema"] in p.ARCHIVE_SCHEMAS else
+                'extensions tombstones found; migrate --to-latest before archival')
+    result["progress_summary"] = _progress_summary(state if resolved else None, git)
+    if getattr(args, "brief", False):
+        return {"brief": True, **{key: result[key] for key in (
+            "exists", "schema", "revision", "status", "writer", "lease_until", "lease_active",
+            "drift", "git_check_status", "drift_check_status", "verification", "write_ready",
+            "document_valid", "objects_integrity", "archive_integrity", "warnings", "progress_summary")}}
     if args.command == "validate":
         p.require(matches, "derived view conflict")
         if archive["integrity"] == "invalid":
@@ -2259,22 +2392,8 @@ def input_patch(args):
     return patch
 
 
-def mutate(args, root, dry_run=False):
-    patch = (input_patch(args)
-             if args.command in ("update", "save", "prune")
-             and getattr(args, "input", None) else {})
-    # The custom Markdown of a v5 document is a managed, externalised collection:
-    # it is applied here (the state has to be resolved first) and never reaches
-    # the generic upsert, which only knows the v2/v3/v4 collections.
-    markdown_patch = patch.get("markdown") if isinstance(patch, dict) else None
-    if markdown_patch is not None:
-        apply_patch = {key: value for key, value in patch.items() if key != "markdown"}
-    else:
-        apply_patch = patch
-    p.require(args.expected_revision is not None and args.expected_revision >= 0, "expected revision required")
-    p.identifier(args.writer)
-    p.identifier(args.operation_id)
-    p.require(0 < args.lease_minutes <= 1440, "lease must be 1 to 1440 minutes")
+def _operation_identity(args, patch):
+    """Reuse the historical receipt fingerprint, not a competing hash contract."""
     hash_input = {"command": args.command, "writer": args.writer, "patch": patch,
                   "expected_revision": args.expected_revision, "lease_minutes": args.lease_minutes,
                   "allow_drift": bool(getattr(args, "allow_drift", False)),
@@ -2292,7 +2411,34 @@ def mutate(args, root, dry_run=False):
         hash_input["to_v5"] = True
     if getattr(args, "to_v6", False):
         hash_input["to_v6"] = True
+    if getattr(args, "acquire", False):
+        hash_input["acquire"] = True
     operation_hash = p.digest(hash_input)
+    operation_id = getattr(args, "operation_id", None)
+    if operation_id is None and args.command in ("resume", "update", "save"):
+        operation_id = "auto-" + operation_hash[:24]
+    p.require(operation_id is not None, "operation id required")
+    p.identifier(operation_id)
+    return operation_id, operation_hash
+
+
+def mutate(args, root, dry_run=False):
+    acquire = args.command == "save" and bool(getattr(args, "acquire", False))
+    patch = (input_patch(args)
+             if args.command in ("update", "save", "prune")
+             and getattr(args, "input", None) else {})
+    # The custom Markdown of a v5 document is a managed, externalised collection:
+    # it is applied here (the state has to be resolved first) and never reaches
+    # the generic upsert, which only knows the v2/v3/v4 collections.
+    markdown_patch = patch.get("markdown") if isinstance(patch, dict) else None
+    if markdown_patch is not None:
+        apply_patch = {key: value for key, value in patch.items() if key != "markdown"}
+    else:
+        apply_patch = patch
+    p.require(args.expected_revision is not None and args.expected_revision >= 0, "expected revision required")
+    p.identifier(args.writer)
+    p.require(0 < args.lease_minutes <= 1440, "lease must be 1 to 1440 minutes")
+    args.operation_id, operation_hash = _operation_identity(args, patch)
     # Never create relay or lock if CURRENT is absent.
     fs.child(root, ".relay", "CURRENT.md", exists=True)
     with (nullcontext() if dry_run else fs.locked(fs.child(root, ".relay", "CURRENT.md.lock"))):
@@ -2332,7 +2478,8 @@ def mutate(args, root, dry_run=False):
                     p.require(operation["hash"] == operation_hash, "operation ID reused with different input")
                     replayed_bytes = len(old.encode("utf-8"))
                     return {"revision": operation["revision"], "current_revision": int(meta["revision"]),
-                            "replayed": True,
+                            "replayed": True, "operation_id": args.operation_id,
+                            "writer": p.meta_value(meta["writer"]), "lease_until": p.meta_value(meta["lease_until"]),
                             "capacity": _capacity_receipt(
                                 meta["schema"], replayed_bytes, replayed_bytes,
                                 committed=False, replayed=True,
@@ -2350,18 +2497,19 @@ def mutate(args, root, dry_run=False):
                     p.require(operation["hash"] == operation_hash, "operation ID reused with different input")
                     replayed_bytes = len(old.encode("utf-8"))
                     return {"revision": operation["revision"], "current_revision": int(meta["revision"]),
-                            "replayed": True, "archived": True,
+                            "replayed": True, "archived": True, "operation_id": args.operation_id,
+                            "writer": p.meta_value(meta["writer"]), "lease_until": p.meta_value(meta["lease_until"]),
                             "capacity": _capacity_receipt(
                                 meta["schema"], replayed_bytes, replayed_bytes,
                                 committed=False, replayed=True,
                                 next_cycle_reason="a replay commits no new state")}
-        p.require(int(meta["revision"]) == args.expected_revision, "revision conflict")
+        p.require(int(meta["revision"]) == args.expected_revision, f"revision conflict; current_revision={meta['revision']}")
         p.require(matches or args.command == "recover", "derived view conflict; review direct edits before writing")
         git = git_state.capture(root)
         p.require(git["kind"] != "error", "Git inspection failed")
         old_git = baseline(meta)
         changed_branch = old_git.get("kind") == "git" and (git.get("kind") != "git" or old_git.get("branch") != git.get("branch"))
-        if ((args.command == "resume" or (args.command == "migrate" and meta["schema"] in p.SUPPORTED_SCHEMAS)) and old_git != git) or changed_branch:
+        if (((args.command == "resume" or acquire) or (args.command == "migrate" and meta["schema"] in p.SUPPORTED_SCHEMAS)) and old_git != git) or changed_branch:
             p.require(getattr(args, "allow_drift", False),
                       "Git drift detected; review before --allow-drift")
         migrate_to_v3 = args.command == "migrate" and getattr(args, "to_v3", False)
@@ -2397,11 +2545,17 @@ def mutate(args, root, dry_run=False):
         else:
             p.require(state is not None, "v1 is read-only; run migrate preview and explicit --apply")
         if args.command == "resume":
-            p.require(not lease_active(meta) or meta["writer"] == args.writer, "lease conflict")
+            p.require(not lease_active(meta) or meta["writer"] == args.writer, f"lease conflict; writer={meta['writer']}; lease_until={meta['lease_until']}")
             if full["project"]["status"] == "paused":
                 full["project"]["status"] = "active"
         elif args.command in ("update", "save", "compact", "prune"):
-            p.require(meta["writer"] == args.writer and lease_active(meta), "missing, expired or conflicting lease; resume first")
+            if acquire:
+                p.require(not lease_active(meta) or meta["writer"] == args.writer,
+                          f"lease conflict; writer={meta['writer']}; lease_until={meta['lease_until']}")
+                if full["project"]["status"] == "paused":
+                    full["project"]["status"] = "active"
+            else:
+                p.require(meta["writer"] == args.writer and lease_active(meta), f"missing, expired or conflicting lease; resume first; writer={meta['writer']}; lease_until={meta['lease_until']}")
             if args.command in ("update", "save"):
                 apply_patch, extension_keys = _extension_archive_keys(apply_patch, meta["schema"])
                 full = p.apply(full, apply_patch, git, targets=target_resolver)
@@ -2534,7 +2688,7 @@ def mutate(args, root, dry_run=False):
                            "count": document_state["archive"]["count"]}
                           if schema in p.ARCHIVE_SCHEMAS else None)
         if dry_run:
-            return {"dry_run": True, "estimate_only": False, "would_fit": True,
+            return {"dry_run": True, "estimate_only": False, "would_fit": True, "operation_id": args.operation_id,
                     "archive": archive_report,
                     "source_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
                     "revision": int(meta["revision"]), "candidate_revision": revision,
@@ -2611,7 +2765,7 @@ def mutate(args, root, dry_run=False):
             object_store_new_bytes=published["bytes_written"],
             archived_segments=len(segments), next_save_cycle=next_cycle)
         return {**result, "revision": revision, "schema": schema, "writer": updates["writer"],
-                "lease_until": updates["lease_until"], "replayed": False}
+                "lease_until": updates["lease_until"], "replayed": False, "operation_id": args.operation_id}
 
 
 def parser():
@@ -2622,6 +2776,8 @@ def parser():
                     "markdown", "archive", "gc"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--root", default=".")
+        if command == "status":
+            cmd.add_argument("--brief", action="store_true", help="bounded read-only summary; use handoff for details")
         if command == "init":
             cmd.add_argument("--project-id")
             cmd.add_argument("--name")
@@ -2631,7 +2787,7 @@ def parser():
             required = command not in ("migrate", "compact")
             cmd.add_argument("--writer", required=required)
             cmd.add_argument("--expected-revision", type=int, required=required)
-            cmd.add_argument("--operation-id", required=required)
+            cmd.add_argument("--operation-id", required=required and command not in ("resume", "update", "save"))
             cmd.add_argument("--lease-minutes", type=int, default=30)
             cmd.add_argument("--allow-drift", action="store_true")
         if command in ("resume", "update", "save", "recover"):
@@ -2639,6 +2795,8 @@ def parser():
                              help="disable automatic receipt compaction for this write")
         if command in ("update", "save", "prune"):
             cmd.add_argument("--input", help="JSON change file, or - for standard input")
+        if command in ("save", "capacity"):
+            cmd.add_argument("--acquire", action="store_true", help="save in one commit, acquiring and releasing the lease atomically")
         if command == "prune":
             cmd.add_argument("--apply", action="store_true",
                              help="commit the validated cascade; otherwise preview only")
@@ -2656,6 +2814,7 @@ def parser():
                              help="run every remaining migration step in order, each as its own commit")
             cmd.add_argument("--source-sha256")
         if command == "capacity":
+            cmd.add_argument("--extension-limit", type=int, default=10, help="largest user extension keys to list (1 to 100)")
             cmd.add_argument("--writer")
             cmd.add_argument("--expected-revision", type=int)
             cmd.add_argument("--operation-id")

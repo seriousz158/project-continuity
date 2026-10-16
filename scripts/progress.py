@@ -962,7 +962,13 @@ def validate(state, targets=None):
         require(item["result"] in ("pass", "fail", "not_run"), "invalid evidence result")
         require(isinstance(item["baseline"], dict), "invalid evidence baseline")
         require(type(item["generation"]) is int and 0 <= item["generation"] <= tasks[item["task_id"]]["generation"], "invalid evidence generation")
-        require(isinstance(item["acceptance"], list) and all(isinstance(a, str) and a in tasks[item["task_id"]]["acceptance"] for a in item["acceptance"]), "unknown evidence acceptance")
+        valid_acceptance = (isinstance(item["acceptance"], list) and all(
+            isinstance(a, str) and a in tasks[item["task_id"]]["acceptance"]
+            for a in item["acceptance"]))
+        if not valid_acceptance:
+            available = build_ac_map([tasks[item["task_id"]]])["entries"]
+            require(False, "unknown evidence acceptance; available [" + ", ".join(
+                row["ac_id"] + " index=" + str(row["index"]) for row in available) + "]")
     revoked, replaced = _validate_corrections(corrections, evidence, decisions, targets)
     live = _effective_evidence(evidence, revoked, replaced)
     for task in tasks.values():
@@ -989,7 +995,15 @@ def validate(state, targets=None):
 
 def apply(state, patch, baseline, targets=None):
     """Apply typed partial upserts; no deletions, arbitrary paths or evidence rewrites."""
-    require(isinstance(patch, dict) and set(patch) <= {"project", *COLLECTIONS, "extensions", "corrections", "markdown"}, "invalid change fields")
+    allowed = {"project", *COLLECTIONS, "extensions", "corrections", "markdown"}
+    require(isinstance(patch, dict), "invalid change fields: expected object")
+    unexpected = set(patch) - allowed
+    # Only bounded field identifiers are diagnostic metadata; arbitrary keys
+    # can themselves contain payloads and are never echoed.
+    names = sorted(key if isinstance(key, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key)
+                   else "<non-field-key>" for key in unexpected)
+    require(not unexpected, "invalid change fields: unexpected [" + ", ".join(names)
+            + "]; allowed [" + ", ".join(sorted(allowed)) + "]")
     out = copy.deepcopy(state)
     if "project" in patch:
         require(isinstance(patch["project"], dict), "project change must be object")
