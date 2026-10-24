@@ -24,6 +24,10 @@
 - Status verification honors each check's verified flag, so a normal baseline
   pass is no longer misreported as baseline_pass failure.
 
+- Sharing docs and the generated ignore comment distinguish CURRENT as an
+  entrypoint from the complete v4+ export/verify dependency closure; ignore rules
+  themselves are unchanged.
+
 The 0.6.0 candidate below improves ergonomics, lease responses and diagnostics;
 its automatic archive still only handles finished-task decisions. Upgrading to
 that baseline alone does not relieve an active task's decision capacity.

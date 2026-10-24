@@ -384,9 +384,13 @@ operation receipts and the existing extension-merge policy.
 
 The default initialization keeps relay runtime data local through
 `.relay/.gitignore`. If a team deliberately shares current state through Git,
-share only `CURRENT.md` and its intentional ignore configuration, never the
-whole `.relay/` directory. Review content for sensitive data and treat Git
-conflicts as protocol conflicts. The tool never commits or pushes.
+review the ignore configuration and the complete dependency closure. For
+v2/v3 the progress is inline, but compacted receipt segments remain required.
+For v4+ CURRENT is the authoritative entrypoint, not a self-contained artifact:
+use an `export` / `verify` handoff package, or deliberately share CURRENT plus
+all reachable objects and receipt segments. Do not blanket-share `.relay/`:
+history, inbox, temporary files and locks stay local. Review sensitive content
+and treat Git conflicts as protocol conflicts. The tool never commits or pushes.
 
 ## Git baseline limitations
 

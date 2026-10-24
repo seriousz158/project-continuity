@@ -247,8 +247,11 @@ Project Continuity intentionally does not:
 - claim that best-effort secret detection is complete redaction.
 
 Runtime data stays local by default. If a team explicitly chooses Git sharing,
-share only `CURRENT.md` and the intentional ignore configuration—never the whole
-`.relay/` directory. Review conflicts by stable record ID.
+v2/v3 inline progress can use `CURRENT.md` plus its intentional ignore rules
+(and any reachable receipt segments). v4+ CURRENT is an entrypoint, not a
+self-contained copy: transfer with `export` / `verify`, or deliberately share
+CURRENT with all reachable objects and receipt segments. Do not share unrelated
+history, inbox, locks or the whole `.relay/` directory. Review conflicts by stable record ID.
 
 Git fingerprinting is bounded to 256 MiB of tracked worktree content and fails
 closed on unsupported links, submodules, non-regular files, unmerged indexes,

@@ -202,7 +202,7 @@ Project Continuity 明确不会：
 - 自动解决 Git 冲突，或简单按更新时间选择真相；
 - 把防误写秘密扫描宣传成完整脱敏系统。
 
-运行态默认保存在本地。团队明确选择 Git 共享时，只共享 `CURRENT.md` 和有意设置的 ignore 配置，绝不共享整个 `.relay/`。冲突必须按稳定记录 ID 审查。
+运行态默认保存在本地。v2/v3 的内联进展可共享 `CURRENT.md`、有意设置的 ignore 配置及其可达回执段。v4+ 的 CURRENT 只是入口，不能单独交接：优先使用 `export` / `verify` 交接包；选择 Git 共享时，必须一起包含全部可达对象与回执段。不要共享无关历史、inbox、锁或整个 `.relay/`。冲突必须按稳定记录 ID 审查。
 
 Git 指纹最多读取 256 MiB tracked 工作区内容；遇到不支持的链接、submodule、非普通文件、未合并 index 或不可用数据时会失败关闭。依赖换行转换或 clean filter 的仓库可能被保守地报告为 dirty。
 

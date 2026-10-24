@@ -2266,7 +2266,7 @@ def initialize(args, root):
             fs.child(root, ".relay", name).mkdir(mode=0o700, exist_ok=True)
         ignore = fs.child(root, ".relay", ".gitignore")
         if not ignore.exists():
-            fs.atomic(ignore, "# Local by default. To share CURRENT.md only, replace * with /history/, /receipts/, /inbox/, /objects/, /*.lock, /.*.tmp\n*\n")
+            fs.atomic(ignore, "# Local by default. For v4+ transfer use export/verify; review protocol.md before intentional Git sharing.\n*\n")
         published = obs.publish(root, plans) if plans else {"warnings": []}
         warnings = published["warnings"] + fs.atomic(current, doc)
     return {"revision": 0, "schema": schema, "warnings": warnings}
