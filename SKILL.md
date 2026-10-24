@@ -66,7 +66,7 @@ writer/lease instead. Never guess conflict state.
 - Reference assurance is graded: claimed < ref_resolved < ref_bound <
   externally_checked. A resolved plain path proves existence, not checked content.
 - Keep pointers, not payloads. Decisions keep conclusion/scope and a reason/evidence
-  pointer (~300 UTF-8 bytes of prose); details go in evidence files. No secrets or full chats.
+  pointer (~300 UTF-8 bytes of prose); details go in evidence files. No secrets, full chats or unrestricted logs.
 - JSON is authoritative; generated Markdown is not parsed as state. Resolve
   external objects under an explicit project root; missing/corrupt objects or
   exhausted budgets are degraded/incomplete, never PASS, and block writes.
