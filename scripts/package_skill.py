@@ -58,6 +58,7 @@ FILES = (
     "tests/test_v05_fixes.py",
     "tests/test_v060.py",
     "tests/test_decision_archive.py",
+    "tests/test_review_regressions.py",
     "tests/test_v4_objects.py",
     "tests/test_v6_archive.py",
     "tests/test_write_current.py",

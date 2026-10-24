@@ -838,7 +838,9 @@ def coverage(state, project_id, task_id=None, limit=20, baseline=None, current_s
     next_cursor = (mint_cursor(identity, cursor_task, offset + len(rows))
                    if cursor_task is not None and offset + len(rows) < span else None)
     checks = _verification_checks(state, view, rows, baseline, integrity, flags, block)
-    record = _verification_record(checks, complete=True)
+    complete = (offset == 0 and len(rows) == span
+                and not any(row["truncated"] or row["withdrawn_page"]["has_more"] for row in rows))
+    record = _verification_record(checks, complete=complete)
     return {"schema": COVERAGE_SCHEMA, "project_id": project_id, "task_filter": task_id,
             "content_sha256": current_sha256,
             "baseline_source": "captured" if baseline is not None else "not_checked",
