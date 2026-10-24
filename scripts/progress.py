@@ -1252,6 +1252,42 @@ def plan_archive(state, revision, reason, targets=None):
     return validate(hot, targets), records
 
 
+def decision_archive_candidates(state):
+    """Technical eligibility only; the caller decides which decisions stay visible."""
+    require(isinstance(state.get("corrections", []), list),
+            "decision archival requires resolved corrections")
+    blockers = {}
+    for row in state.get("corrections", []):
+        if row["target_type"] == "decision":
+            blockers.setdefault(row["target_id"], []).append(
+                {"collection": "corrections", "id": row["id"],
+                 "reason": "hot correction targets this decision"})
+    return [{"id": row["id"], "blocked_by": blockers.get(row["id"], [])}
+            for row in state["decisions"]]
+
+
+def archive_decisions(state, ids, revision, reason, targets=None):
+    """Explicit, non-cascading split; each original record is stored verbatim."""
+    require(isinstance(ids, list), "archive_decisions must be a list of decision IDs")
+    for key in ids:
+        identifier(key)
+    require(len(ids) == len(set(ids)), "duplicate archive_decisions ID")
+    selected = set(ids)
+    decisions = keyed(state["decisions"], "decisions")
+    require(selected <= set(decisions), "archive_decisions ID is not a hot decision")
+    blocked = [row for row in decision_archive_candidates(state)
+               if row["id"] in selected and row["blocked_by"]]
+    if blocked:
+        raise Invalid("decision archival blocked: " + "; ".join(
+            row["id"] + " <- " + ", ".join(
+                item["collection"] + ":" + item["id"] + " (" + item["reason"] + ")"
+                for item in row["blocked_by"]) for row in blocked))
+    hot = copy.deepcopy(state)
+    hot["decisions"] = [row for row in state["decisions"] if row["id"] not in selected]
+    records = [archive_record("decisions", key, decisions[key], revision, reason) for key in ids]
+    return validate(hot, targets), records
+
+
 def archive_extensions(state, keys, revision, reason):
     """Explicitly move named extension namespaces into the archive."""
     hot = copy.deepcopy(state)

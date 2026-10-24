@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import Counter
 from contextlib import nullcontext
 import hashlib
 import io
@@ -518,6 +519,7 @@ def _plan_candidate(lines, body, state, updates, project_id, *, force=False, aut
 
 AUTO_ARCHIVE_REASON = "automatic: the document reached the compaction trigger"
 EXPLICIT_ARCHIVE_REASON = "explicit: extension namespace archived by the writer"
+DECISION_ARCHIVE_REASON = "explicit: decision IDs selected by the writer"
 
 
 def _plan_document(full, root, meta, schema, lines, body, updates, *, targets=None,
@@ -576,6 +578,103 @@ def _extension_archive_keys(patch, schema):
     trimmed["extensions"] = {key: value for key, value in patch["extensions"].items()
                              if value is not None}
     return trimmed, keys
+
+
+def _apply_progress_patch(state, patch, git, root, meta, revision, targets):
+    """Shared typed patch path for writes and forecasts; no storage side effects."""
+    p.require(isinstance(patch, dict), "change must be an object")
+    ids = patch.get("archive_decisions", [])
+    if "archive_decisions" in patch:
+        p.require(meta["schema"] in p.ARCHIVE_SCHEMAS,
+                  "archive_decisions requires v6; use migrate --to-latest")
+        p.require(isinstance(ids, list), "archive_decisions must be a list of decision IDs")
+        for key in ids:
+            p.identifier(key)
+        p.require(len(ids) == len(set(ids)), "duplicate archive_decisions ID")
+    incoming = p.keyed(patch.get("decisions", []), "decisions")
+    p.require(not (set(ids) & set(incoming)),
+              "a decision ID cannot be archived and upserted in the same patch")
+    if incoming and meta["schema"] in p.ARCHIVE_SCHEMAS:
+        new_ids = set(incoming) - {row["id"] for row in state["decisions"]}
+        if new_ids:
+            cold_ids = {row["record_id"] for row in relay_v4.collect_archive(
+                state, root, meta["project_id"]) if row["collection"] == "decisions"}
+            p.require(not (new_ids & cold_ids), "new decision reuses an archived decision ID")
+    trimmed = {key: value for key, value in patch.items() if key != "archive_decisions"}
+    trimmed, extension_keys = _extension_archive_keys(trimmed, meta["schema"])
+    state = p.apply(state, trimmed, git, targets=targets)
+    records = []
+    if ids:
+        state, records = p.archive_decisions(state, ids, revision, DECISION_ARCHIVE_REASON, targets)
+    if extension_keys:
+        state, extension_records = p.archive_extensions(
+            state, extension_keys, revision, EXPLICIT_ARCHIVE_REASON)
+        records.extend(extension_records)
+    return state, records
+
+
+def _collection_occupancy(body, total):
+    """Exact UTF-8 value spans in CURRENT's JSON (keys/separators are overhead)."""
+    a, b = p.block(body, p.DATA_START, p.DATA_END)
+    raw = body[a:b]
+    decoder, sizes = json.JSONDecoder(), {}
+    offset = len(raw) - len(raw.lstrip()) + 1
+    while True:
+        while offset < len(raw) and raw[offset].isspace():
+            offset += 1
+        if raw[offset] == "}":
+            break
+        key, offset = decoder.raw_decode(raw, offset)
+        while raw[offset].isspace() or raw[offset] == ":":
+            offset += 1
+        start = offset
+        _value, offset = decoder.raw_decode(raw, offset)
+        size = len(raw[start:offset].encode("utf-8"))
+        sizes[key] = {"bytes": size, "ratio": round(size / total, 4)}
+        while raw[offset].isspace():
+            offset += 1
+        if raw[offset] == ",":
+            offset += 1
+    return sizes
+
+
+def _decision_candidates(state):
+    rows = p.decision_archive_candidates(state)
+    return {"eligible": [{"id": row["id"]} for row in rows if not row["blocked_by"]],
+            "blocked": [row for row in rows if row["blocked_by"]],
+            "selection": "technical eligibility is not a recommendation; explicitly select IDs",
+            "preview": "capacity --input change.json (archive_decisions must explicitly list IDs)"}
+
+
+def _capacity_advice(schema, collections, candidates):
+    largest = max(collections, key=lambda key: collections[key]["bytes"], default=None)
+    share = collections[largest]["ratio"] if largest else 0
+    prefix = (f"{schema}; largest collection={largest} ({share:.1%}); "
+              f"eligible decisions={len(candidates['eligible'])}; ")
+    if schema in p.ARCHIVE_SCHEMAS:
+        return prefix + ("review explicit archive_decisions IDs; " if candidates["eligible"] else
+                         "no eligible decisions; review blocked relationships or other business content; ") + \
+            "preview: capacity --input change.json; write_ready is not a patch-fit guarantee"
+    return prefix + "use migrate --to-latest, then preview: capacity --input change.json"
+
+
+def _archived_decisions(root, meta, stub, state, task_id=None):
+    """Read-only discovery, bounded by the existing archive resolver budget."""
+    try:
+        records = (relay_v4.collect_archive(stub, root, meta["project_id"])
+                   if meta["schema"] in p.ARCHIVE_SCHEMAS else [])
+    except (RelayError, p.Invalid, fs.Error, OSError, ValueError) as exc:
+        return {"count": None, "task_filter": task_id, "read": "archive",
+                "reason": exc.code if isinstance(exc, RelayError) else "archive_read_failed",
+                "decision_id_conflicts": None}
+    decisions = [row for row in records if row["collection"] == "decisions"]
+    hot_ids = {row["id"] for row in state["decisions"]}
+    cold_ids = Counter(row["record_id"] for row in decisions)
+    conflicts = sorted(key for key, count in cold_ids.items() if key in hot_ids or count > 1)
+    selected = [row for row in decisions if task_id is None or task_id in row["record"]["task_ids"]]
+    read = "archive" + (" --task " + task_id if task_id is not None else "")
+    return {"count": len(selected), "task_filter": task_id, "read": read,
+            "decision_id_conflicts": conflicts}
 
 
 def _capacity_sections(document, body):
@@ -845,12 +944,9 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
             p.text(project_patch["next_step"], "next_step", empty=True)
             state["project"]["next_step"] = project_patch["next_step"]
         else:
-            patch, extension_keys = _extension_archive_keys(patch, meta["schema"])
-            state = p.apply(state, patch, git if git is not None else {"kind": "none"},
-                            targets=targets)
-            if extension_keys:
-                state, extension_records = p.archive_extensions(
-                    state, extension_keys, revision, EXPLICIT_ARCHIVE_REASON)
+            state, extension_records = _apply_progress_patch(
+                state, patch, git if git is not None else {"kind": "none"}, root, meta,
+                revision, targets)
     receipt = {"id": operation_id, "hash": "0" * 64, "revision": revision}
     state["operations"] = list(state["operations"]) + [receipt]
     status = state["project"]["status"]
@@ -1214,8 +1310,9 @@ def _capacity_receipt(schema, before_bytes, after_bytes, *, committed, replayed=
     elif used > limit:
         action = "over the limit: migration or business review required"
     elif near:
-        action = ("above the compaction trigger: compact receipts or migrate to an "
-                  "external schema before the next write")
+        action = ("above the compaction trigger: review capacity --input change.json; "
+                  + ("explicit archive_decisions can move selected v6 decisions"
+                     if schema in p.ARCHIVE_SCHEMAS else "review migrate --to-latest"))
     else:
         action = "none"
     if next_save_cycle is None:
@@ -1369,7 +1466,7 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
                    if md_patch is not None else patch)
     if isinstance(apply_patch, dict) and "prune" in apply_patch:
         p.require(set(apply_patch) == {"prune", "project"},
-                  "prune input may contain only prune and project")
+                  "prune input must contain exactly prune and project")
         p.require(apply_patch["prune"].get("target_revision") == int(meta["revision"]),
                   "prune target revision does not match current revision")
     stamp = now()
@@ -1491,7 +1588,7 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
             if not nxt["would_fit"] or nxt["end_headroom_bytes"] < 0:
                 result["recommended_action"] = (
                     "this save fits, but the next ordinary resume->save cycle does not; "
-                    "compact receipts or migrate to an external schema first")
+                    "review capacity --input change.json and explicit archival first")
         except (RelayError, p.Invalid, fs.Error, OSError, ValueError, KeyError) as exc:
             result["next_save_cycle_estimate"] = {
                 "status": "not_computed",
@@ -1529,6 +1626,28 @@ def capacity_view(args, root):
         extension_limit = getattr(args, "extension_limit", 10)
         p.require(1 <= extension_limit <= 100, "--extension-limit must be 1 to 100")
         result["extensions"] = _extension_governance(stub, meta["schema"], extension_limit)
+        collections = _collection_occupancy(body, size)
+        result["current"]["collections"] = collections
+        state = (relay_v4.expand(stub, root, meta["project_id"])
+                 if meta["schema"] in relay_v4.EXTERNAL_SCHEMAS else stub)
+        result["decision_archival"] = _decision_candidates(state)
+        result["decision_archival"]["supported"] = meta["schema"] in p.ARCHIVE_SCHEMAS
+        archive_entries = (relay_v4.archive_entries(root, meta["project_id"], stub["archive"], obs.Budget())
+                           if meta["schema"] in p.ARCHIVE_SCHEMAS else [])
+        result["cold_archive"] = {"count": len(archive_entries),
+                                  "object_bytes": sum(row["object_bytes"] for row in archive_entries)}
+        result["archived_decisions"] = _archived_decisions(root, meta, stub, state)
+        largest = []
+        for name in (*p.COLLECTIONS, "corrections"):
+            for record in stub.get(name, []) if isinstance(stub.get(name), list) else []:
+                largest.append({"collection": name, "id": record["id"],
+                                "bytes": len(json.dumps(record, ensure_ascii=False,
+                                                       separators=(",", ":")).encode("utf-8"))})
+        result["largest_records"] = sorted(largest, key=lambda row: (-row["bytes"], row["id"]))[:10]
+        result["recommended_action"] = _capacity_advice(meta["schema"], collections, result["decision_archival"])
+        result["collection_hints"] = ([{"collection": "decisions", "ratio": collections["decisions"]["ratio"],
+                                       "reason": "decisions exceed 40% of CURRENT; keep concise conclusions and evidence pointers"}]
+                                     if collections["decisions"]["ratio"] > 0.4 else [])
     patch = input_patch(args) if getattr(args, "input", None) else ({} if getattr(args, "acquire", False) else None)
     if patch is not None:
         p.require(stub is not None, "v1 is read-only; migrate before previewing a patch")
@@ -1851,6 +1970,8 @@ def handoff_view(args, root):
     archive = _archive_summary(stub, meta)
     if archive is not None:
         result["archive"] = archive
+        result["archived_decisions"] = _archived_decisions(
+            root, meta, stub, state, getattr(args, "task", None) or state["project"]["current_task"])
     scan(json.dumps(result, ensure_ascii=False), enforce_limit=False)
     return result
 
@@ -1864,6 +1985,15 @@ def archive_view(args, root):
     budget = obs.Budget()
     entries = relay_v4.archive_entries(root, meta["project_id"], stub["archive"], budget)
     wanted = getattr(args, "id", None)
+    task_id = getattr(args, "task", None)
+    if task_id is not None:
+        p.identifier(task_id)
+        selected = []
+        for entry in entries:
+            row = obs.read_object(root, meta["project_id"], "archive", entry, budget)
+            if row["collection"] == "decisions" and task_id in row["record"]["task_ids"]:
+                selected.append(entry)
+        entries = selected
     if wanted is not None:
         records = [obs.read_object(root, meta["project_id"], "archive", entry, budget)
                    for entry in entries]
@@ -2196,6 +2326,8 @@ def _progress_summary(state, baseline):
     result["gap_count"] = uncovered
     records = sorted(enumerate(state["evidence"]), key=lambda pair: (datetime.fromisoformat(pair[1]["at"].replace("Z", "+00:00")), pair[0]))
     result["recent_evidence"] = [{"id": e["id"], "result": e["result"]} for _, e in records[-3:]]
+    result["handoff_hint"] = "handoff" + (" --task " + current_id if current_id else "") + " --limit 5"
+    result["archived_decisions_hint"] = "archive" + (" --task " + current_id if current_id else "")
     return result
 
 
@@ -2267,6 +2399,7 @@ def status(args, root):
               "document_valid": bool(matches),
               "migration_required": meta["schema"] not in p.SUPPORTED_SCHEMAS,
               "mapping_review_required": None,
+              "mapping_review_reason": "mapping_state_unresolved",
               "requires_drift_review": block["check"]["state"] in (CHECK_STALE, CHECK_UNCHECKED),
               "git_check_status": observed["state"],
               "drift_check_status": block["check"]["state"],
@@ -2282,6 +2415,8 @@ def status(args, root):
     result["baseline"] = block
     result["recorded_baseline"] = block["recorded"]
     result["observed_baseline"] = block["observed"]
+    if getattr(args, "verify_integrity", False):
+        checks["integrity"] = integrity_check(root, meta, stub, True, state)
     result["checks"] = checks
     result["verification_record"] = verification_record(checks, ("baseline", "integrity"),
                                                         complete=bool(matches))
@@ -2313,15 +2448,14 @@ def status(args, root):
         result["compact_fits"] = projected <= limit
         result["write_ready"] = result["write_ready"] and result["compact_fits"]
         if result["compact_recommended"]:
-            result["warnings"].append(
-                "capacity governance recommended; " + meta["schema"] +
-                (" requires explicit migration" if meta["schema"] == p.SCHEMA_V2
-                 else " governs eligible writes automatically"))
+            result["warnings"].append(_capacity_advice(
+                meta["schema"], _collection_occupancy(body, size), _decision_candidates(state)))
         if not result["compact_fits"]:
             result["warnings"].append("receipt compaction cannot fit the current business content under the document limit")
         migration_info = state["extensions"].get("migration", {})
         pending = isinstance(migration_info, dict) and migration_info.get("mapping_review_required", False)
         result["mapping_review_required"] = bool(pending)
+        result["mapping_review_reason"] = "field_mapping_and_reader_cutover_pending" if pending else None
         if pending and matches:
             result["verification"] = "UNVERIFIED"
     elif stub is None:
@@ -2341,18 +2475,27 @@ def status(args, root):
                 if meta["schema"] in p.ARCHIVE_SCHEMAS else
                 'extensions tombstones found; migrate --to-latest before archival')
     result["progress_summary"] = _progress_summary(state if resolved else None, git)
+    if resolved:
+        occupancy = _collection_occupancy(body, size)
+        if occupancy["decisions"]["ratio"] > 0.4:
+            result["warnings"].append("decisions exceed 40% of CURRENT; keep concise conclusions and evidence pointers")
+    result["capacity"]["headroom_bytes"] = limit - size
     if getattr(args, "brief", False):
         return {"brief": True, **{key: result[key] for key in (
             "exists", "schema", "revision", "status", "writer", "lease_until", "lease_active",
             "drift", "git_check_status", "drift_check_status", "verification", "write_ready",
             "document_valid", "objects_integrity", "archive_integrity", "mapping_review_required",
-            "migration_required", "warnings", "progress_summary")}}
+            "migration_required", "mapping_review_reason", "capacity", "warnings", "progress_summary")}}
     if args.command == "validate":
         p.require(matches, "derived view conflict")
         if archive["integrity"] == "invalid":
             p.require(False, "receipt archive integrity check failed")
         if object_error is not None:
             raise object_error
+        if getattr(args, "verify_integrity", False):
+            check = checks["integrity"]
+            p.require(not check.get("applicable", True) or check.get("verified"),
+                      "integrity check did not pass; " + str(check.get("reason") or check["state"]))
     return result
 
 
@@ -2559,15 +2702,12 @@ def mutate(args, root, dry_run=False):
             else:
                 p.require(meta["writer"] == args.writer and lease_active(meta), f"missing, expired or conflicting lease; resume first; writer={meta['writer']}; lease_until={meta['lease_until']}")
             if args.command in ("update", "save"):
-                apply_patch, extension_keys = _extension_archive_keys(apply_patch, meta["schema"])
-                full = p.apply(full, apply_patch, git, targets=target_resolver)
-                if extension_keys:
-                    full, extension_records = p.archive_extensions(
-                        full, extension_keys, int(meta["revision"]) + 1,
-                        EXPLICIT_ARCHIVE_REASON)
+                full, extension_records = _apply_progress_patch(
+                    full, apply_patch, git, root, meta, int(meta["revision"]) + 1,
+                    target_resolver)
             elif args.command == "prune":
                 p.require(set(patch) == {"prune", "project"},
-                          "prune input may contain only prune and project")
+                          "prune input must contain exactly prune and project")
                 full = p.prune(full, patch["prune"], expected_revision=args.expected_revision)
                 p.text(patch["project"].get("next_step"), "next_step", empty=True)
                 full["project"]["next_step"] = patch["project"]["next_step"]
@@ -2677,7 +2817,9 @@ def mutate(args, root, dry_run=False):
             if schema in relay_v4.EXTERNAL_SCHEMAS:
                 raise RelayError(RELAY_CURRENT_CAPACITY_EXCEEDED,
                                  "candidate is " + str(final_bytes) + " bytes; the limit is "
-                                 + str(limit))
+                                 + str(limit) + "; " + _capacity_advice(
+                                     schema, _collection_occupancy(split(candidate, enforce_limit=False)[1], final_bytes),
+                                     _decision_candidates(full)))
             hint = "explicit migrate --to-v3 is required" if schema == p.SCHEMA_V2 else "business capacity requires review"
             p.require(False, f"document exceeds 64 KiB; candidate={preview_size}, after={final_bytes}, "
                       f"excess={final_bytes - p.MAX_BYTES}; {hint}; no content was truncated")
@@ -2780,6 +2922,9 @@ def parser():
                     "markdown", "archive", "gc"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--root", default=".")
+        if command == "validate":
+            cmd.add_argument("--verify-integrity", action="store_true",
+                             help="read every reachable object; inspect checks.integrity separately from progress verification")
         if command == "status":
             cmd.add_argument("--brief", action="store_true", help="bounded read-only summary; use handoff for details")
         if command == "init":
@@ -2878,6 +3023,7 @@ def parser():
             cmd.add_argument("--writer")
             cmd.add_argument("--expected-revision", type=int)
         if command == "archive":
+            cmd.add_argument("--task", help="list archived decisions associated with this task")
             cmd.add_argument("--id", default=None,
                              help="print archived records by archive id or original record id")
             cmd.add_argument("--limit", type=int, default=50)

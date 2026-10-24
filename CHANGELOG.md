@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Explicit v6 `archive_decisions` patch operation on update/save (including
+  save --acquire) and capacity previews; lossless records, immutable-ID and
+  hot-reference guards reuse existing archive and transaction formats.
+- Archive lookup by task, archived-decision discovery in handoff, capacity
+  collection/record diagnostics and actionable preview hints. Brief reports
+  remaining bytes; decision-share warnings are nonblocking.
+- `validate --verify-integrity` now performs the existing deep check. Mapping
+  review gets an explicit reason; prune requirements and concise decision
+  recording guidance are documented.
+
+The 0.6.0 candidate below improves ergonomics, lease responses and diagnostics;
+its automatic archive still only handles finished-task decisions. Upgrading to
+that baseline alone does not relieve an active task's decision capacity.
+Unreleased explicit archival requires caller selection; it never silently hides
+binding decisions. VERSION remains 0.6.0; these changes are not a tagged release.
+
 ## 0.6.0 - 2026-10-16
 
 ### Added

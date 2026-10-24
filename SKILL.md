@@ -43,7 +43,8 @@ writer/lease instead. Never guess conflict state.
   `--apply`, retaining lease. Prefer v6 archival; objects are not deleted.
 - `archive`: read-only cold archive listing; `--id` reads records verbatim.
   On v6, an explicit `{"extensions":{"key":null}}` patch archives a user key
-  losslessly. Preserve archive targets; hints never write.
+  losslessly. `archive_decisions` explicitly moves selected v6 decisions; see
+  commands.md for references, previews and retrieval. Hints never select decisions.
 - `compact`: dry-run forecast; `--apply` requires lease. Normal writes govern
   receipts automatically without truncating content; over-limit writes fail.
 - `gc`: dry-run by default. Show preview and obtain required deletion
@@ -64,7 +65,9 @@ writer/lease instead. Never guess conflict state.
   A claimed pass can satisfy the gate, but is not externally verified evidence.
 - Reference assurance is graded: claimed < ref_resolved < ref_bound <
   externally_checked. A resolved plain path proves existence, not checked content.
-- Keep pointers, not payloads. No secrets, full chats or unrestricted logs.
+- Keep pointers, not payloads. Decisions record the conclusion, scope and a short
+  reason/evidence pointer (about 300 UTF-8 bytes of prose); details belong in evidence files.
+  No secrets, full chats or unrestricted logs.
 - JSON is authoritative; generated Markdown is not parsed as state. Resolve
   external objects under an explicit project root; missing/corrupt objects or
   exhausted budgets are degraded/incomplete, never PASS, and block writes.

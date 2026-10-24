@@ -29,7 +29,8 @@ python scripts/write_current.py save --root <project> \
 # Explicitly prune a referentially closed historical set.  The manifest must
 # enumerate every affected task, blocker, evidence and decision ID plus a
 # target revision and reason.  A dry run performs no write; --apply retains the
-# lease so a following save can release it.  External object files are kept.
+# lease so a following save can release it. Both dry-run and apply require
+# a live lease and at least one task. External object files are kept.
 python scripts/write_current.py prune --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id> \
   --input prune-manifest.json
@@ -276,3 +277,75 @@ models this one commit, not a resume/save cycle. Capacity with writer and
 expected revision can derive the exact next resume ID without --operation-id.
 Normal defaults and all prior field meanings are preserved; full status adds
 progress_summary, and mutation responses add operation_id/current replay lease.
+
+
+## Explicit v6 decision archival (Unreleased)
+
+Use the existing update/save transaction, including `save --acquire`:
+
+```json
+{"archive_decisions":["D1","D2"],"decisions":[{"id":"D-current","task_ids":["T1"],"conclusion":"Current binding decisions: read archive --task T1","reason":"See the original records and evidence pointers."}]}
+```
+
+`archive_decisions` is a patch operation, never a stored document field. It
+requires v6; v2–v5 callers must explicitly `migrate --to-latest`. Existing
+`decisions` list upserts remain immutable. Only update/save and capacity patch
+previews accept this operation; no automatic selection or cascading is done.
+A hot correction targeting a selected decision blocks the transaction and names
+the blocker. The same ID cannot be both archived and upserted; new decisions
+cannot reuse cold decision IDs. Legacy hot/cold conflicts remain readable and
+are reported by capacity/handoff, rather than invalidating the old document.
+Tasks, generations and acceptance conditions are not changed by archival.
+
+```bash
+python scripts/write_current.py capacity --root <project> --acquire \
+  --writer <writer> --expected-revision <n> --operation-id <op> --input change.json
+python scripts/write_current.py save --root <project> --acquire \
+  --writer <writer> --expected-revision <n> --operation-id <op> --input change.json
+python scripts/write_current.py archive --root <project> --task <actual-task-id> --limit 5
+python scripts/write_current.py archive --root <project> --id <original-decision-id>
+python scripts/write_current.py validate --root <project> --verify-integrity
+```
+
+Preview and commit must use the same state, operation ID, writer, lease duration
+and clock for byte-for-byte size predictions. A preview is not a reservation.
+Check `checks.integrity.state`, `verified` and `reason` for the deep check;
+`validate --verify-integrity` exits nonzero on an applicable failed/incomplete
+integrity check. Integrity does not assert coverage or external execution.
+`handoff --limit 1` is paginated, not a complete handoff or project verification.
+
+Capacity exposes exact JSON value spans under `current.collections` (byte
+counts and ratios of CURRENT, excluding keys and separators), compact JSON
+sizes for `largest_records`, and referenced cold record envelope bytes under
+`cold_archive.object_bytes` (not disk reclaimable bytes or CURRENT savings).
+`decision_archival.eligible` is technical eligibility, **not** a recommendation
+to hide a currently binding decision; `blocked` names hot relationships.
+No all-candidates patch is generated. Explicitly select IDs and preview the
+actual patch, including any short current entry, using the commit planner.
+It includes receipt, lease, index and current-entry costs; record sizes alone
+cannot predict savings. A nonblocking hint fires if decisions exceed 40% of
+CURRENT, even when individual records are shorter than the long-record threshold.
+
+These fields describe different questions:
+- `document_valid`: the document's structure/derived view is valid.
+- `write_ready`: observed write preconditions hold, not a promise that any patch fits.
+- `patch_preview.would_fit`: this particular modeled transaction fits.
+
+Brief includes remaining capacity, `handoff --task <actual-current-task> --limit 5`
+and an archive lookup hint. No nonexistent task placeholder is emitted.
+Handoff reports associated archived decisions and their lookup command. A
+still-binding decision must stay discoverable; retain a concise current entry
+when it carries important context. The tool does not invent summaries.
+
+`mapping_review_reason=field_mapping_and_reader_cutover_pending` explains
+`mapping_review_required=true` in status/brief. Existing `UNVERIFIED` and
+`unverified` values are preserved; consumers should use the boolean/reason,
+not case comparisons. An unresolved mapping state has a null boolean and
+`mapping_state_unresolved` reason.
+
+Prune input must contain exactly `prune` and `project`; it requires a task
+cascade and a live lease even for dry-run. For decision-only capacity relief,
+use explicit archival, not prune. Keep decision prose around 300 UTF-8 bytes
+where practical: the decision, necessary scope and reason/evidence pointer.
+Do not duplicate full reviews, user quotations or digest lists. This is advice,
+not a schema limit or permission to truncate immutable records.

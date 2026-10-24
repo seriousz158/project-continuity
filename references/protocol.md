@@ -169,6 +169,14 @@ A decision or correction that spans a hot and a cold record keeps the whole set
 hot; no hot record ever points into the archive.  The acceptance map is rebuilt
 from the remaining tasks.
 
+Explicit decision archival uses the patch-only `archive_decisions` list on
+update/save, without changing this wire schema or archive-record/v1. It preserves
+each full record, including task_ids, and uses an explicit reason distinct from
+automatic archival. No age/size heuristic selects decisions. Hot incoming
+relationships must be closed first; this operation refuses them without a
+cascade. Ordinary immutable upserts and existing transaction/replay guarantees
+are unchanged. See commands.md for usage and discovery through `archive --task`.
+
 User extensions are archived only on request: on v6 an update with
 `"extensions": {"key": null}` moves that key into the archive and removes it.
 Managed keys (`compaction`, `ac_map`, `external_markdown`, `blocker_scope`,
