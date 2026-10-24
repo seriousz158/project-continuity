@@ -70,7 +70,7 @@ class SnapshotRecoveryTests(V6Case):
         self.object.rename(self.root / '.relay/quarantined-evidence.json')
         result = self.recover()
         self.assertEqual(result['revision'], 3)
-        state = cli.resolve((self.root / '.relay/CURRENT.md').read_text(), self.root)
+        state = cli.resolve((self.root / '.relay/CURRENT.md').read_text(encoding='utf-8'), self.root)
         self.assertEqual(state['evidence'], [])
         self.assertEqual(len(state['operations']), 3)
         self.assertEqual(self.call('validate', '--verify-integrity')['checks']['integrity']['state'], 'verified')

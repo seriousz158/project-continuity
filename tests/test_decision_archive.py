@@ -35,7 +35,7 @@ class DecisionArchiveTests(V6Case):
                          patch=patch, expect=expect, frozen=STAMP)
 
     def state(self):
-        text = (self.root / '.relay/CURRENT.md').read_text()
+        text = (self.root / '.relay/CURRENT.md').read_text(encoding='utf-8')
         return text, cli.resolve(text, self.root)
 
     def test_archive_and_pointer_are_atomic_lossless_and_discoverable(self):
@@ -180,7 +180,7 @@ class DecisionArchiveTests(V6Case):
         text, lines, body, meta, stub, _matches = cli.read_envelope(self.root)
         stub['decisions'].append(original)
         # Simulate an older writer that allowed a hot/cold ID collision.
-        (self.root / '.relay/CURRENT.md').write_text(cli.metadata(lines, {}) + p.render_body(stub, body))
+        (self.root / '.relay/CURRENT.md').write_text(cli.metadata(lines, {}) + p.render_body(stub, body), encoding='utf-8', newline='\n')
         self.assertTrue(self.call('status')['document_valid'])
         self.assertEqual(self.call('capacity')['archived_decisions']['decision_id_conflicts'], ['d1'])
         self.write({'decisions': [original]}, revision=2, op='same-existing')
@@ -216,7 +216,7 @@ class ActiveCapacityTests(V6Case):
         preview = self.call('capacity', *args, patch=patch, frozen=STAMP)['patch_preview']
         patch['extensions']['context'] += 'x' * (32200 - preview['final_candidate_bytes'])
         self.call('save', *args, patch=patch, frozen=STAMP)
-        original = (self.root / '.relay/CURRENT.md').read_text()
+        original = (self.root / '.relay/CURRENT.md').read_text(encoding='utf-8')
         report = self.call('capacity')
         self.assertEqual(report['current']['collections']['decisions']['bytes'], 24515)
         self.assertTrue(report['collection_hints'])
@@ -230,7 +230,7 @@ class ActiveCapacityTests(V6Case):
         archive_patch = {'archive_decisions': ['long' + str(i) for i in range(17)]}
         self.call('save', '--acquire', '--writer', 'a', '--expected-revision', '1',
                   '--operation-id', 'archive', patch=archive_patch, frozen=STAMP)
-        archived = (self.root / '.relay/CURRENT.md').read_text()
+        archived = (self.root / '.relay/CURRENT.md').read_text(encoding='utf-8')
         self.assertTrue(migrate_compare.compare(original, archived, self.root)[0])
         self.assertLess(len(archived.encode()), p.V4_COMPACTION_TRIGGER_BYTES)
         self.assertEqual(self.call('archive', '--id', 'long0')['records'][0]['record'], decisions[0])
@@ -239,7 +239,7 @@ class ActiveCapacityTests(V6Case):
         committed = self.call('save', '--acquire', '--writer', 'a', '--expected-revision', '2',
                               '--operation-id', 'new', patch=large, frozen=STAMP)
         self.assertEqual(preview['final_candidate_bytes'], committed['capacity']['used_bytes'])
-        after = cli.resolve((self.root / '.relay/CURRENT.md').read_text(), self.root)
+        after = cli.resolve((self.root / '.relay/CURRENT.md').read_text(encoding='utf-8'), self.root)
         self.assertEqual(before['tasks'], after['tasks'])
         self.assertEqual(before['project']['current_task'], after['project']['current_task'])
         self.assertEqual(self.call('handoff', '--task', 'live')['archived_decisions']['count'], 17)
