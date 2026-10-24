@@ -96,3 +96,70 @@ class SnapshotRecoveryTests(V6Case):
         shared.write_bytes(shared.read_bytes() + b' ')
         self.recover(expect=2)
         self.assertEqual((self.root / '.relay/CURRENT.md').read_bytes(), before)
+
+
+class ProtocolReferenceAssuranceTests(V6Case):
+    def setUp(self):
+        super().setUp()
+        self.call('init')
+        self.project_id = cli.read_envelope(self.root)[3]['project_id']
+
+    def object_file(self, payload, record_type='evidence', project_id=None):
+        data = obs.envelope_text(project_id or self.project_id, record_type, payload).encode()
+        sha = obs.sha256_hex(data)
+        path = obs.object_path(self.root, record_type, sha)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path, sha
+
+    def assert_claimed(self, path, sha):
+        relative = '/'.join(path.relative_to(self.root / '.relay').parts)
+        self.assertEqual(cli._grade_reference(self.root, relative), 'claimed')
+        self.assertEqual(cli._grade_reference(self.root, sha), 'claimed')
+
+    def test_pseudo_protocol_and_cross_project_objects_are_not_bound(self):
+        data = b'{"id":"fake","not":"a protocol envelope"}'
+        sha = obs.sha256_hex(data)
+        path = obs.object_path(self.root, 'evidence', sha)
+        path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
+        self.assert_claimed(path, sha)
+        path, sha = self.object_file({'id': 'other'}, project_id='another-project')
+        self.assert_claimed(path, sha)
+
+    def test_ancestor_symlink_is_not_followed_in_either_branch(self):
+        import tempfile
+        data = obs.envelope_text(self.project_id, 'evidence', {'id': 'test'}).encode()
+        sha = obs.sha256_hex(data)
+        path = obs.object_path(self.root, 'evidence', sha)
+        path.parent.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as raw:
+            target = cli.fs.root_path(raw)
+            (target / path.name).write_bytes(data)
+            try:
+                path.parent.symlink_to(target, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest('symlinks unavailable')
+            self.assert_claimed(path, sha)
+
+    def test_valid_objects_indexes_and_plain_paths_keep_their_grades(self):
+        path, sha = self.object_file({'id': 'valid'})
+        relative = '/'.join(path.relative_to(self.root / '.relay').parts)
+        self.assertEqual(cli._grade_reference(self.root, relative), 'ref_bound')
+        self.assertEqual(cli._grade_reference(self.root, sha), 'ref_bound')
+        self.assertEqual(cli._grade_reference(self.root, path.as_posix()), 'ref_bound')
+        _doc, _lines, _body, meta, stub, _matches = cli.read_envelope(self.root)
+        index = obs.index_path(self.root, 'ac-map', stub['ac_map']['index'])
+        self.assertEqual(cli._grade_reference(self.root, '/'.join(index.relative_to(self.root / '.relay').parts)), 'ref_bound')
+        (self.root / 'report.md').write_text('plain evidence', encoding='utf-8')
+        self.assertEqual(cli._grade_reference(self.root, 'report.md'), 'ref_resolved')
+        path.write_bytes(path.read_bytes() + b' ')
+        self.assert_claimed(path, sha)
+
+    def test_foreign_namespace_and_prefix_are_not_reinterpreted(self):
+        path, sha = self.object_file({'id': 'valid'})
+        self.assertEqual(cli._grade_reference(self.root, '../outside/.relay/' + '/'.join(path.relative_to(self.root / '.relay').parts)), 'claimed')
+        data = obs.envelope_text(self.project_id, 'evidence', {'id': 'wrong-type'}).encode()
+        sha = obs.sha256_hex(data)
+        wrong = obs.object_path(self.root, 'correction', sha)
+        wrong.parent.mkdir(parents=True, exist_ok=True); wrong.write_bytes(data)
+        self.assert_claimed(wrong, sha)

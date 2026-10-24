@@ -18,6 +18,9 @@
 - Snapshot recovery can repair damaged current-only objects after CAS, lease
   and receipt checks; snapshot dependencies are still fully validated.
 
+- Protocol-object/digest assurance now checks ancestor links, object format,
+  type and project binding through owned storage; plain path grading is unchanged.
+
 The 0.6.0 candidate below improves ergonomics, lease responses and diagnostics;
 its automatic archive still only handles finished-task decisions. Upgrading to
 that baseline alone does not relieve an active task's decision capacity.

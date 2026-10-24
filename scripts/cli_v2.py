@@ -1346,29 +1346,59 @@ def _reference_kind(value):
     return "plain_path_reference"
 
 
-def _bound_object(path):
-    """True when a content-addressed file exists and its bytes match its name."""
+def _bound_object(root, path, project_id):
+    """Protocol identity, format and project binding via the owned storage checks."""
     try:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > obs.OBJECT_MAX_BYTES:
+        relative = path.relative_to(fs.child(root, ".relay"))
+        name = "/".join(relative.parts)
+        match = _OBJECT_NAME.fullmatch(name)
+        if not match or match["shard"] != match["sha"][:2] or match["ext"] != "json":
             return False
-        return hashlib.sha256(path.read_bytes()).hexdigest() == path.name.split(".", 1)[0]
-    except OSError:
+        # fs.child/read_bytes validate every ancestor, links and read races.
+        checked_path = fs.child(root, ".relay", *relative.parts, exists=True)
+        budget = obs.Budget()
+        if relative.parts[1] == "index":
+            obs.read_index(root, project_id, match["type"], match["sha"], budget)
+        elif relative.parts[1] == "manifest":
+            obs.read_manifest_object(root, project_id, match["sha"], budget)
+        else:
+            record_type = relative.parts[1]
+            obs.require_record_type(record_type)
+            raw = obs._read_hashed(checked_path, match["sha"], budget,
+                                   RELAY_OBJECT_SCHEMA_INVALID, "reference object")
+            envelope = obs._envelope(raw, project_id, record_type, "reference object")
+            obs.record_id_of(envelope["payload"], RELAY_OBJECT_SCHEMA_INVALID, "reference object")
+            if obs.canonical(envelope).encode("utf-8") != raw:
+                return False
+        return True
+    except (RelayError, fs.Error, OSError, ValueError, KeyError, UnicodeError):
         return False
 
 
-def _grade_reference(root, value):
-    """Assurance of one evidence `ref`, read-only and bounded to the project root."""
+def _grade_reference(root, value, project_id=None):
+    """Assurance of one evidence ref; plain path behavior is unchanged."""
     kind = _reference_kind(value)
     relay = root / ".relay"
-    if kind == "protocol_object_reference":
-        relative = value.split(".relay/", 1)[1] if ".relay/" in value else value
-        if ".." in Path(relative).parts:
-            return "claimed"
-        return "ref_bound" if _bound_object(relay / relative) else "claimed"
-    if kind == "content_digest":
+    if kind in ("protocol_object_reference", "content_digest"):
+        if project_id is None:
+            try:
+                project_id = read_envelope(root)[3]["project_id"]
+            except (RelayError, p.Invalid, fs.Error, OSError, ValueError):
+                return "claimed"
+        if kind == "protocol_object_reference":
+            candidate = Path(value)
+            if ".." in candidate.parts:
+                return "claimed"
+            if value.startswith("objects/"):
+                candidate = relay / candidate
+            elif value.startswith(".relay/"):
+                candidate = root / candidate
+            elif not candidate.is_absolute():
+                return "claimed"
+            return "ref_bound" if _bound_object(root, candidate, project_id) else "claimed"
         matches = sorted((relay / "objects").glob(f"*/{value[:2]}/{value}.*")) + \
             sorted((relay / "objects").glob(f"index/*/{value[:2]}/{value}.*"))
-        return "ref_bound" if any(_bound_object(path) for path in matches) else "claimed"
+        return "ref_bound" if any(_bound_object(root, path, project_id) for path in matches) else "claimed"
     if kind != "plain_path_reference" or "\n" in value or len(value) > 1024:
         return "claimed"
     # `a.md; b/manifest.json` names several files; every one of them must exist.
@@ -1390,12 +1420,12 @@ def _path_exists(root, value):
         return False
 
 
-def grade_references(root, state):
+def grade_references(root, state, project_id=None):
     """Per-evidence assurance for the shared verification judgement."""
     records = state.get("evidence") if isinstance(state, dict) else None
     if not isinstance(records, list):
         return {}
-    return {record["id"]: _grade_reference(root, record.get("ref"))
+    return {record["id"]: _grade_reference(root, record.get("ref"), project_id)
             for record in records if isinstance(record, dict) and "id" in record}
 
 
@@ -1892,7 +1922,7 @@ def coverage_view(args, root):
                                                                   False)), state),
                                flags={"acknowledge_external":
                                       bool(getattr(args, "acknowledge_external", False)),
-                                      "evidence_assurance": grade_references(root, state)},
+                                      "evidence_assurance": grade_references(root, state, meta["project_id"])},
                                block=block)
     # The CLI contributes only its own observation of the environment and its
     # integrity/external flags; the check set and the verification record come
@@ -1955,7 +1985,7 @@ def handoff_view(args, root):
                                       state),
             flags={"acknowledge_external":
                    bool(getattr(args, "acknowledge_external", False)),
-                   "evidence_assurance": grade_references(root, state)},
+                   "evidence_assurance": grade_references(root, state, meta["project_id"])},
             block=block)
     except RelayError as exc:
         if "cursor" in str(exc):
