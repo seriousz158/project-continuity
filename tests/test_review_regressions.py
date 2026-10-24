@@ -163,3 +163,26 @@ class ProtocolReferenceAssuranceTests(V6Case):
         wrong = obs.object_path(self.root, 'correction', sha)
         wrong.parent.mkdir(parents=True, exist_ok=True); wrong.write_bytes(data)
         self.assert_claimed(wrong, sha)
+
+
+class StatusVerificationTests(V6Case):
+    def test_matching_baseline_pass_is_not_a_failure(self):
+        self.call('init')
+        report = self.call('status')
+        self.assertEqual(report['checks']['baseline']['state'], 'pass')
+        self.assertTrue(report['checks']['baseline']['verified'])
+        self.assertTrue(report['verification_record']['verified'])
+        self.assertIsNone(report['verification_record']['reason'])
+        self.assertTrue(report['write_ready'])
+
+    def test_stale_and_unchecked_baseline_remain_unverified(self):
+        self.call('init')
+        (self.root / 'new.txt').write_text('changed', encoding='utf-8')
+        report = self.call('status')
+        self.assertFalse(report['verification_record']['verified'])
+        self.assertFalse(report['write_ready'])
+        from unittest import mock
+        with mock.patch.object(cli.git_state, 'capture', return_value={'kind': 'error'}):
+            report = self.call('status')
+        self.assertFalse(report['verification_record']['verified'])
+        self.assertFalse(report['write_ready'])

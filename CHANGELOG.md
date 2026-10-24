@@ -21,6 +21,9 @@
 - Protocol-object/digest assurance now checks ancestor links, object format,
   type and project binding through owned storage; plain path grading is unchanged.
 
+- Status verification honors each check's verified flag, so a normal baseline
+  pass is no longer misreported as baseline_pass failure.
+
 The 0.6.0 candidate below improves ergonomics, lease responses and diagnostics;
 its automatic archive still only handles finished-task decisions. Upgrading to
 that baseline alone does not relieve an active task's decision capacity.

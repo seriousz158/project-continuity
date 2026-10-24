@@ -1806,7 +1806,8 @@ def verification_record(checks, required=(), complete=True, reason=None):
     failures = [(name, check) for name, check in checks.items()
                 if name in required and (check.get("applicable", True)
                                          if isinstance(check, dict) else True)
-                and _check_state(check) != "verified"]
+                and not check.get("verified")
+                and _check_state(check) != "not_required"]
     not_checked = sorted(name for name, check in checks.items()
                          if _check_state(check) == "not_checked")
     if not complete:
