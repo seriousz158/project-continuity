@@ -2596,7 +2596,8 @@ def mutate(args, root, dry_run=False):
         markdown_records = None
         stub_regenerated = False
         markdown_change = None
-        if state is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS:
+        snapshot_recovery = args.command == "recover" and bool(args.snapshot)
+        if state is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS and not snapshot_recovery:
             full = relay_v4.expand(state, root, meta["project_id"])
             if meta["schema"] in p.MARKDOWN_SCHEMAS:
                 markdown_records = relay_v4.collect_markdown(state, root, meta["project_id"])
@@ -2729,7 +2730,16 @@ def mutate(args, root, dry_run=False):
                     p.require(snap_meta["schema"] == meta["schema"],
                               "recovery requires a snapshot of the same external schema")
                     snap_state, snap_matches = parsed_body(snap_body)
+                    # A snapshot is the repair source, not the damaged CURRENT's
+                    # objects. CAS, lease and receipt-chain checks above still apply.
+                    check = relay_v4.object_integrity(
+                        root, snap_meta["project_id"], snap_state, snap_meta["schema"])
+                    p.require(check["verified"], "snapshot integrity check failed; "
+                              + str(check.get("reason") or check["state"]))
                     full = relay_v4.expand(snap_state, root, snap_meta["project_id"])
+                    target_resolver = relay_v4.make_target_resolver(root, meta["project_id"], snap_state)
+                    if snap_meta["schema"] in p.MARKDOWN_SCHEMAS:
+                        markdown_records = relay_v4.collect_markdown(snap_state, root, meta["project_id"])
                 else:
                     full, snap_matches = parsed_body(snap_body)
                 p.require(snap_matches, "snapshot view conflict")

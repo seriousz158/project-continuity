@@ -372,7 +372,13 @@ or hosts.
 After a crash, inspect `status` and `validate`. `recover` requires an expired
 lease and an audit reason. If selecting a snapshot, use only a filename already
 reported from `.relay/history/`. Recovery is explicit repair, not a way to take
-over a current writer.
+over a current writer. A same-schema external snapshot can repair missing or
+corrupt objects reachable only from CURRENT: it is resolved and deep-checked
+without first resolving those damaged objects. CURRENT's CAS, lease and receipt
+chain must still validate. Missing/corrupt snapshot dependencies refuse recovery;
+without a snapshot the current objects must resolve normally. Snapshot recovery
+restores its external Markdown as well as managed progress, preserving current
+operation receipts and the existing extension-merge policy.
 
 ## Git sharing
 

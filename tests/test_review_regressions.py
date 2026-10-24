@@ -1,6 +1,7 @@
 """Targeted audit regressions with synthetic local state only."""
 from test_v6_archive import V6Case
 import cli_v2 as cli
+import objectstore as obs
 
 
 class CoveragePaginationTests(V6Case):
@@ -47,3 +48,51 @@ class CoveragePaginationTests(V6Case):
         self.assertTrue(any(row['truncated'] for row in page['rows']))
         self.assertFalse(page['verification_record']['complete'])
         self.assertFalse(page['verification_record']['verified'])
+
+
+class SnapshotRecoveryTests(V6Case):
+    def setUp(self):
+        super().setUp()
+        self.call('init')
+        self.call('save', '--acquire', '--writer', 'a', '--expected-revision', '0',
+                  '--operation-id', 'task', patch={'tasks': [{'id': 't', 'title': 'work', 'acceptance': ['A']}]})
+        self.call('save', '--acquire', '--writer', 'a', '--expected-revision', '1',
+                  '--operation-id', 'evidence', patch={'evidence': [CoveragePaginationTests.evidence('e1', ['A'])]})
+        self.snapshot = next((self.root / '.relay/history').glob('r1-*.md')).name
+        self.object = next((self.root / '.relay/objects/evidence').rglob('*.json'))
+
+    def recover(self, revision=2, expect=0, snapshot=True):
+        return self.call('recover', '--writer', 'b', '--expected-revision', str(revision),
+                         '--operation-id', 'recover', '--reason', 'synthetic recovery drill',
+                         *(['--snapshot', self.snapshot] if snapshot else []), expect=expect)
+
+    def test_snapshot_recovers_missing_current_object(self):
+        self.object.rename(self.root / '.relay/quarantined-evidence.json')
+        result = self.recover()
+        self.assertEqual(result['revision'], 3)
+        state = cli.resolve((self.root / '.relay/CURRENT.md').read_text(), self.root)
+        self.assertEqual(state['evidence'], [])
+        self.assertEqual(len(state['operations']), 3)
+        self.assertEqual(self.call('validate', '--verify-integrity')['checks']['integrity']['state'], 'verified')
+        self.assertTrue(self.recover()['replayed'])
+
+    def test_corruption_does_not_bypass_cas_or_lease(self):
+        self.leased(2, 'lease')
+        self.object.write_bytes(self.object.read_bytes() + b' ')
+        before = (self.root / '.relay/CURRENT.md').read_bytes()
+        error = self.recover(revision=2, expect=2)
+        self.assertIn('revision conflict', error['error'])
+        error = self.recover(revision=3, expect=2)
+        self.assertIn('active lease', error['error'])
+        self.assertEqual((self.root / '.relay/CURRENT.md').read_bytes(), before)
+
+    def test_snapshot_dependencies_must_resolve_and_no_snapshot_still_fails(self):
+        self.object.write_bytes(self.object.read_bytes() + b' ')
+        before = (self.root / '.relay/CURRENT.md').read_bytes()
+        self.recover(snapshot=False, expect=2)
+        _text, _lines, _body, meta, stub, _matches = cli.read_envelope(self.root)
+        entry = obs.read_index(self.root, meta['project_id'], 'ac-map', stub['ac_map']['index'], obs.Budget())[0]
+        shared = obs.object_path(self.root, 'ac-map', entry['object_sha256'])
+        shared.write_bytes(shared.read_bytes() + b' ')
+        self.recover(expect=2)
+        self.assertEqual((self.root / '.relay/CURRENT.md').read_bytes(), before)
