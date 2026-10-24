@@ -2003,6 +2003,11 @@ def handoff_view(args, root):
         result["archive"] = archive
         result["archived_decisions"] = _archived_decisions(
             root, meta, stub, state, getattr(args, "task", None) or state["project"]["current_task"])
+        failure = result["archived_decisions"].get("reason")
+        if failure and not result["checks"]["integrity"].get("checked"):
+            # Known corruption from discovery cannot coexist with a successful
+            # handoff. An explicitly requested deep check already reports it.
+            raise RelayError(failure, "archived decision discovery could not complete")
     scan(json.dumps(result, ensure_ascii=False), enforce_limit=False)
     return result
 

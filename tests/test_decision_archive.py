@@ -251,3 +251,26 @@ class ActiveCapacityTests(V6Case):
             self.assertEqual(resume['compaction']['archived_receipts'], 0)
             self.assertEqual(save['compaction']['archived_receipts'], 0)
         self.assertTrue(self.call('validate', '--verify-integrity')['checks']['integrity']['verified'])
+
+
+class ArchiveDiscoveryIntegrityTests(V6Case):
+    def test_known_cold_corruption_never_looks_like_verified_handoff(self):
+        (self.root / 'report.md').write_text('evidence', encoding='utf-8')
+        self.call('init')
+        self.call('save', '--acquire', '--writer', 'a', '--expected-revision', '0',
+                  '--operation-id', 'seed', patch={
+                      'tasks': [{'id': 'live', 'title': 'work', 'acceptance': ['A']}],
+                      'decisions': [decision('d1')],
+                      'evidence': [{'id': 'e1', 'task_id': 'live', 'check': 'unit',
+                                    'result': 'pass', 'at': '2026-10-24T12:00:00Z',
+                                    'ref': 'report.md', 'acceptance': ['A']}]})
+        self.call('save', '--acquire', '--writer', 'a', '--expected-revision', '1',
+                  '--operation-id', 'archive', patch={'archive_decisions': ['d1']})
+        self.assertTrue(self.call('handoff')['verification_record']['verified'])
+        path = next((self.root / '.relay/objects/archive').rglob('*.json'))
+        path.write_bytes(path.read_bytes() + b' ')
+        error = self.call('handoff', expect=2)
+        self.assertEqual(error['error'], 'RELAY_OBJECT_HASH_MISMATCH')
+        checked = self.call('handoff', '--verify-integrity')
+        self.assertFalse(checked['verification_record']['verified'])
+        self.assertEqual(checked['checks']['integrity']['state'], 'degraded')
