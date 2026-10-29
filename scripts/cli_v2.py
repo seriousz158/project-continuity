@@ -973,12 +973,12 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
         updates.update(git_fields(git))
     if root is not None and meta["schema"] in relay_v4.EXTERNAL_SCHEMAS \
             and not p.is_external(state):
-        (state, document_state, _plans, _texts, _candidate, segments, would_compact,
+        (state, document_state, plans, _texts, _candidate, segments, would_compact,
          _ungoverned, projected, _moved, _before) = _plan_document(
             state, root, meta, meta["schema"], lines, body, updates, targets=targets,
             markdown=markdown, archive=extension_records)
     else:
-        document_state = state
+        document_state, plans = state, []
         _candidate, projected, segments, would_compact = _plan_candidate_from_state(
             lines, body, document_state, updates, meta["project_id"], markdown=markdown)
     receipt_bytes = len(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
@@ -990,7 +990,7 @@ def _commit_model(meta, lines, body, state, command, revision, operation_id, wri
             "writer_bytes": len(writer.encode("utf-8")),
             "operation_id_bytes": len(operation_id.encode("utf-8")),
             "revision_digits": len(str(revision)), "state": model_state,
-            "patched": bool(patch)}
+            "plans": plans, "patched": bool(patch)}
 
 
 def _modelled_next_commit(lines, body, stub, meta):
@@ -1489,6 +1489,8 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
     markdown_records = None
     if schema in p.MARKDOWN_SCHEMAS:
         markdown_records = relay_v4.collect_markdown(stub, root, meta["project_id"])
+    # A modelled resume renders the Markdown as it is; the patch applies later.
+    resume_markdown = markdown_records
     if md_patch is not None:
         p.require(schema in p.MARKDOWN_SCHEMAS, "markdown changes require a v5 document (or v6)")
         markdown_records, _change = p.merge_markdown(markdown_records, md_patch)
@@ -1542,11 +1544,14 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
                                    patch=apply_patch, git=git, targets=resolver,
                                    markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
                                    root=root)
-            save = _commit_model(meta, lines, body, update["state"], "save", revision + 2,
-                                 (operation_id + "-save") if operation_id else "preview-save",
-                                 writer, lease_minutes, stamp, git=git, targets=resolver,
-                                 markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
-                                 root=root)
+            # A chained step starts from a document whose new objects were
+            # only planned by the steps before it, never published.
+            with obs.planned(update["plans"]):
+                save = _commit_model(meta, lines, body, update["state"], "save", revision + 2,
+                                     (operation_id + "-save") if operation_id else "preview-save",
+                                     writer, lease_minutes, stamp, git=git, targets=resolver,
+                                     markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
+                                     root=root)
             steps, mode, commands = [update, save], "update-save", ["update", "save"]
         else:
             model = _commit_model(meta, lines, body, full, "save", revision + 1,
@@ -1560,30 +1565,33 @@ def _patch_preview(root, args, lines, body, meta, stub, patch):
                      forecast_id("resume", revision, {}, "preview-resume"))
         first = _commit_model(meta, lines, body, full, "resume", revision + 1, resume_op,
                               writer, lease_minutes, stamp, git=git, targets=resolver,
-                              root=root)
+                              markdown=resume_markdown, root=root)
         if is_prune:
             prune_op = (operation_id + "-prune") if operation_id else "preview-prune"
-            update = _commit_model(meta, lines, body, first["state"], "update", revision + 2,
-                                   prune_op, writer, lease_minutes, stamp, patch=apply_patch,
-                                   git=git, targets=resolver,
-                                   markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
-                                   root=root)
+            with obs.planned(first["plans"]):
+                update = _commit_model(meta, lines, body, first["state"], "update", revision + 2,
+                                       prune_op, writer, lease_minutes, stamp, patch=apply_patch,
+                                       git=git, targets=resolver,
+                                       markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
+                                       root=root)
             save_op = ((operation_id + "-save") if operation_id else
                        forecast_id("save", revision + 2, {}, "preview-save"))
-            save = _commit_model(meta, lines, body, update["state"], "save", revision + 3,
-                                 save_op, writer, lease_minutes, stamp, git=git,
-                                 targets=resolver,
-                                 markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
-                                 root=root)
+            with obs.planned(first["plans"] + update["plans"]):
+                save = _commit_model(meta, lines, body, update["state"], "save", revision + 3,
+                                     save_op, writer, lease_minutes, stamp, git=git,
+                                     targets=resolver,
+                                     markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
+                                     root=root)
             steps, mode, commands = [first, update, save], "cycle", ["resume", "update", "save"]
         else:
             save_op = ((operation_id + "-save") if operation_id else
                        forecast_id("save", revision + 1, patch, "preview-save"))
-            second = _commit_model(meta, lines, body, first["state"], "save", revision + 2,
-                                   save_op, writer, lease_minutes, stamp, patch=apply_patch,
-                                   git=git, targets=resolver,
-                                   markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
-                                   root=root)
+            with obs.planned(first["plans"]):
+                second = _commit_model(meta, lines, body, first["state"], "save", revision + 2,
+                                       save_op, writer, lease_minutes, stamp, patch=apply_patch,
+                                       git=git, targets=resolver,
+                                       markdown=markdown_records if schema in p.MARKDOWN_SCHEMAS else None,
+                                       root=root)
             steps, mode, commands = [first, second], "cycle", ["resume", "save"]
     summaries = [_step_summary(step, limit) for step in steps]
     final_bytes = summaries[-1]["candidate_bytes"]

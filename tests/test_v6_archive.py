@@ -196,6 +196,105 @@ class V6PreviewTests(V6Case):
         self.assertGreater(committed["archive"]["automatic"], 0)
         self.assertEqual(committed["capacity"]["used_bytes"], preview["final_candidate_bytes"])
 
+    def read_only_preview(self, *args, patch, frozen):
+        files = sorted((self.root / ".relay").rglob("*"))
+        preview = self.call("capacity", *args, patch=patch, frozen=frozen)["patch_preview"]
+        self.assertEqual(sorted((self.root / ".relay").rglob("*")), files)
+        return preview
+
+    def assert_cycle_matches_commits(self, frozen, patch):
+        """An unleased preview predicts its resume and its save byte for byte."""
+        revision = self.call("status")["revision"]
+        preview = self.read_only_preview("--writer", "b", "--expected-revision", str(revision),
+                                         patch=patch, frozen=frozen)
+        resumed = self.call("resume", "--writer", "b", "--expected-revision", str(revision),
+                            frozen=frozen)
+        saved = self.call("save", "--writer", "b", "--expected-revision", str(revision + 1),
+                          patch=patch, frozen=frozen)
+        self.assertEqual(preview["commands"], ["resume", "save"])
+        self.assertEqual(preview["model"]["operation_ids"],
+                         [resumed["operation_id"], saved["operation_id"]])
+        self.assertEqual([step["candidate_bytes"] for step in preview["steps"]],
+                         [resumed["capacity"]["used_bytes"], saved["capacity"]["used_bytes"]])
+        return resumed
+
+    def test_unleased_preview_resume_keeps_the_external_markdown(self):
+        frozen = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+        self.call("init", frozen=frozen)
+        self.leased(frozen=frozen)
+        # Sixteen tasks of six conditions: an inline acceptance map alone would
+        # push the modelled resume past the trigger.
+        tasks = [{"id": f"t{i}", "title": f"task {i}",
+                  "acceptance": [f"condition {i}.{j}" for j in range(6)]} for i in range(16)]
+        tasks.append({"id": "old", "title": "finished", "status": "done", "acceptance": ["ok"]})
+        self.call("save", "--writer", "a", "--expected-revision", "1", "--operation-id", "s1",
+                  frozen=frozen, patch={
+                      "project": {"current_task": "t0"}, "tasks": tasks,
+                      "evidence": [{"id": "e1", "task_id": "old", "check": "unit",
+                                    "result": "pass", "at": "2026-10-28T00:00:00Z",
+                                    "ref": "r", "acceptance": ["ok"]}]})
+        resumed = self.assert_cycle_matches_commits(frozen, {"project": {"next_step": "x"}})
+        self.assertEqual(resumed["archive"]["automatic"], 0)
+
+    def test_unleased_preview_save_reads_what_its_resume_archived(self):
+        frozen = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+        self.call("init", frozen=frozen)
+        self.leased(frozen=frozen)
+        # Saved above the trigger without archiving, so the next resume archives.
+        self.call("save", "--writer", "a", "--expected-revision", "1", "--operation-id", "s1",
+                  "--no-auto-compact", patch=big_patch(), frozen=frozen)
+        resumed = self.assert_cycle_matches_commits(frozen, {"project": {"next_step": "x"}})
+        self.assertGreater(resumed["archive"]["automatic"], 0)
+
+    def seed_prunable(self, frozen):
+        self.call("init", frozen=frozen)
+        self.leased(frozen=frozen)
+        self.call("save", "--writer", "a", "--expected-revision", "1", "--operation-id", "s1",
+                  frozen=frozen, patch={
+                      "project": {"current_task": "live"},
+                      "tasks": [{"id": "old", "title": "superseded", "acceptance": ["ok"]},
+                                {"id": "live", "title": "current", "acceptance": ["ok"]}],
+                      "evidence": [{"id": "e-" + key, "task_id": key, "check": "unit",
+                                    "result": "pass", "at": "2026-10-28T00:00:00Z", "ref": "r",
+                                    "acceptance": ["ok"]} for key in ("old", "live")]})
+
+    @staticmethod
+    def prune_patch(revision):
+        return {"prune": {"task_ids": ["old"], "blocker_ids": [], "evidence_ids": ["e-old"],
+                          "decision_ids": [], "reason": "superseded history",
+                          "target_revision": revision},
+                "project": {"next_step": "continue"}}
+
+    def test_unleased_prune_preview_saves_from_the_pruned_evidence(self):
+        frozen = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+        self.seed_prunable(frozen)
+        preview = self.read_only_preview("--writer", "b", "--operation-id", "p",
+                                         patch=self.prune_patch(2), frozen=frozen)
+        resumed = self.call("resume", "--writer", "b", "--expected-revision", "2",
+                            "--operation-id", "p-resume", frozen=frozen)
+        pruned = self.call("prune", "--apply", "--writer", "b", "--expected-revision", "3",
+                           "--operation-id", "p-prune", patch=self.prune_patch(3), frozen=frozen)
+        saved = self.call("save", "--writer", "b", "--expected-revision", "4",
+                          "--operation-id", "p-save", frozen=frozen)
+        self.assertEqual(preview["commands"], ["resume", "update", "save"])
+        self.assertEqual([step["candidate_bytes"] for step in preview["steps"]],
+                         [resumed["capacity"]["used_bytes"], pruned["capacity"]["used_bytes"],
+                          saved["capacity"]["used_bytes"]])
+
+    def test_leased_prune_preview_saves_from_the_pruned_evidence(self):
+        frozen = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+        self.seed_prunable(frozen)
+        self.leased(2, op="r2", frozen=frozen)
+        preview = self.read_only_preview("--writer", "a", "--operation-id", "p",
+                                         patch=self.prune_patch(3), frozen=frozen)
+        pruned = self.call("prune", "--apply", "--writer", "a", "--expected-revision", "3",
+                           "--operation-id", "p", patch=self.prune_patch(3), frozen=frozen)
+        saved = self.call("save", "--writer", "a", "--expected-revision", "4",
+                          "--operation-id", "p-save", frozen=frozen)
+        self.assertEqual(preview["commands"], ["update", "save"])
+        self.assertEqual([step["candidate_bytes"] for step in preview["steps"]],
+                         [pruned["capacity"]["used_bytes"], saved["capacity"]["used_bytes"]])
+
 
 class V6ReceiptTests(V6Case):
     def test_v6_keeps_sixteen_receipts_inline(self):

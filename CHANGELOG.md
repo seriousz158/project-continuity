@@ -28,6 +28,10 @@
   entrypoint from the complete v4+ export/verify dependency closure; ignore rules
   themselves are unchanged.
 
+- Chained capacity previews (unleased resume -> save, prune cycles) model the
+  resume with the external Markdown and read the objects earlier steps only
+  planned, so v6 previews no longer fail with `index node is missing`.
+
 The 0.6.0 candidate below improves ergonomics, lease responses and diagnostics;
 its automatic archive still only handles finished-task decisions. Upgrading to
 that baseline alone does not relieve an active task's decision capacity.

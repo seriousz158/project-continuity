@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import storage as fs
@@ -285,14 +286,36 @@ def publish(root: Path, plans: list) -> dict:
     return {"created": created, "bytes_written": written, "warnings": unique}
 
 
+# Plans of commits that a read-only preview modelled but never published.  The
+# next modelled commit reads its predecessor's document, whose new objects exist
+# only here; a file on disk always wins and every read still checks the digest.
+_PLANNED = {}
+
+
+@contextmanager
+def planned(plans):
+    """Resolve files missing from the store from these unpublished plans."""
+    saved = dict(_PLANNED)
+    _PLANNED.update((plan["path"], plan["content"]) for plan in plans)
+    try:
+        yield
+    finally:
+        _PLANNED.clear()
+        _PLANNED.update(saved)
+
+
 def _read_hashed(path: Path, expected: str, budget: Budget, code: str, what: str) -> bytes:
-    if not os.path.lexists(path):
+    exists = os.path.lexists(path)
+    if not exists and path not in _PLANNED:
         raise RelayError(code, what + " is missing")
     budget.consume(0)
-    try:
-        data = fs.read_bytes(path, max_bytes=OBJECT_MAX_BYTES)
-    except fs.Error as exc:
-        raise RelayError(RELAY_OBJECT_PATH_INVALID, what + " is not a readable regular file") from exc
+    if exists:
+        try:
+            data = fs.read_bytes(path, max_bytes=OBJECT_MAX_BYTES)
+        except fs.Error as exc:
+            raise RelayError(RELAY_OBJECT_PATH_INVALID, what + " is not a readable regular file") from exc
+    else:
+        data = _PLANNED[path]
     budget.consume(len(data))
     if sha256_hex(data) != expected:
         raise RelayError(RELAY_OBJECT_HASH_MISMATCH, what + " does not match its digest")
