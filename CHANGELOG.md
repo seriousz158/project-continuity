@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Docs: default to one `save --acquire` per standalone checkpoint, group
+  related changes into one patch, and reuse returned revisions rather than
+  requiring a status read before each write.
+
 - Explicit v6 `archive_decisions` patch operation on update/save (including
   save --acquire) and capacity previews; lossless records, immutable-ID and
   hot-reference guards reuse existing archive and transaction formats.

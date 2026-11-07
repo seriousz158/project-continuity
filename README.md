@@ -80,23 +80,30 @@ evidence for every acceptance condition.
 
 ```mermaid
 flowchart LR
-    A[Agent A] -->|status + resume| C[.relay/CURRENT.md]
-    C -->|lease acquired| W[Work and verify]
-    W -->|update milestones| C
-    W -->|save and release lease| H[Handoff]
-    H -->|status + resume| B[Agent B]
-    B --> C
+    A[Agent A] -->|status --brief| C[.relay/CURRENT.md]
+    C -->|read-only context| W[Work and verify]
+    W -->|save --acquire at a checkpoint| C
+    W -->|share recorded state| H[Handoff]
+    H -->|continue read-only| B[Agent B]
+    B -->|status --brief| C
 ```
 
-1. **Inspect** — `status --brief` and `validate` are read-only and never initialize a
-   project.
-2. **Resume** — the agent reviews Git drift and acquires the writer lease using
-   the observed revision.
-3. **Update** — typed ID-based changes advance the revision while retaining the
-   lease.
-4. **Save** — the prior revision is archived, the new state is committed
-   atomically, and the lease is released. Capacity governance runs inside the
-   same locked transaction before the replacement.
+1. **Inspect** — start with read-only `status --brief`. It gives a `drift` flag,
+   `current_task`, uncovered acceptance counts, and up to three recent evidence
+   IDs/results. For `next_step`, the blocker list, or Git baseline details, go
+   straight to full `status` or `handoff`. `status` and `validate` never initialize
+   a project.
+2. **Work and verify** — continue from the recorded state without taking a
+   lease just to start. Read-only continuation makes no writes.
+3. **Group changes** — combine task status, evidence, decisions, blockers, and
+   related `next_step` from the same event into one checkpoint patch. Honor
+   project-required checkpoints and manual-only overrides. No per-message
+   writes, watchers, Git commits, or external actions.
+4. **Save** — `save --acquire` checks the expected revision and rechecks Git
+   drift in the write transaction. It refuses a live foreign lease and names
+   its holder. On success it acquires, writes, and releases in one revision:
+   the prior state is snapshotted and capacity governance runs under the same
+   lock before atomic replacement.
 5. **Recover** — only an expired lease or supported history repair can enter the
    explicit recovery path.
 
@@ -108,12 +115,31 @@ Run the bundled script from a checkout or installed Skill directory.
 # Explicit initialization is the only operation that creates .relay/
 python scripts/write_current.py init --root /path/to/project --name "My Project"
 
-# Read-only inspection
-python scripts/write_current.py status --root /path/to/project
+# Read-only overview
+python scripts/write_current.py status --brief --root /path/to/project
+
+# Optional read-only structure check
 python scripts/write_current.py validate --root /path/to/project
 ```
 
-Read the current revision, then acquire a lease and submit structured changes:
+Use the revision you read (0 after `init` here) to write a standalone
+checkpoint with one structured patch:
+
+```bash
+python scripts/write_current.py save --acquire --root /path/to/project \
+  --writer agent-a --expected-revision 0 --input examples/change.json
+```
+
+A clean drift check at the start does not cover later edits. If the save
+reports drift, review the recorded and observed Git baselines and the changes.
+Only a human may authorize `--allow-drift` after review; agents must not add
+it automatically.
+
+Use `resume` → `update` → ordinary `save` only when you need to hold Relay write
+ownership across steps. The lease protects Relay writes, not the working tree.
+Do not `resume` merely to take a lease or as a prelude to `save --acquire`.
+The default lease lasts 30 minutes. This alternative starts at revision 0 on
+a fresh relay:
 
 ```bash
 python scripts/write_current.py resume --root /path/to/project \
@@ -123,14 +149,21 @@ python scripts/write_current.py update --root /path/to/project \
   --writer agent-a --expected-revision 1 --operation-id update-001 \
   --input examples/change.json
 
+# Record the next step and release the lease, keeping the project active
 python scripts/write_current.py save --root /path/to/project \
-  --writer agent-a --expected-revision 2 --operation-id save-001
+  --writer agent-a --expected-revision 2 --operation-id save-001 --input - <<'JSON'
+{"project":{"status":"active","next_step":"Add an empty-input regression case"}}
+JSON
 ```
 
-Every successful mutation advances the revision. Re-read `status` before the
-next write. An operation ID may be retried only with identical input. The
-default lease lasts 30 minutes; `--allow-drift` is valid only after the reported
-Git drift has been reviewed.
+Unlike `update`, either form of `save` releases the lease and changes an
+`active` project to `paused` unless the patch sets `project.status`.
+
+In the same continuous context, reuse the returned `revision` and `lease_until`.
+On replay, use `current_revision` and the returned current `writer` and
+`lease_until`, not the receipt's historical revision. Retry an operation ID
+only with identical arguments and input. On conflict, read the current state
+and confirm the patch still applies; don't just change the expected revision.
 
 Capacity is handled automatically. A new project starts on v6, whose document
 limit is 32 KiB. At 80% of the limit older operation receipts move losslessly to
@@ -138,12 +171,13 @@ limit is 32 KiB. At 80% of the limit older operation receipts move losslessly to
 is still above that line, finished tasks, resolved blockers and the evidence and
 decisions bound only to them move into a lossless cold archive under
 `.relay/objects/`; `archive --id <record-id>` prints any of them verbatim.
-Preview or explicitly request receipt compaction with:
+Preview receipt compaction, or apply it with an owned live lease and its
+current revision:
 
 ```bash
 python scripts/write_current.py compact --root /path/to/project
 python scripts/write_current.py compact --apply --root /path/to/project \
-  --writer agent-a --expected-revision 3 --operation-id compact-001
+  --writer agent-a --expected-revision <n> --operation-id compact-001
 ```
 
 `compact` without `--apply` is read-only. A one-off `--no-auto-compact` option
@@ -170,10 +204,11 @@ reviewed Git drift.
 | Situation | Recommended flow |
 | --- | --- |
 | Start a new project | Explicit `init`, then inspect the generated state |
-| Begin or resume work | `status` → review Git drift → `resume` |
-| Record task or blocker progress | `update` with typed changes by stable ID |
-| Hand work to another agent | Record verified state with `save`; the lease is released |
-| Continue in a fresh session | `status` → read next step and blockers → `resume` |
+| Begin or resume work | `status --brief`, or full `status` / `handoff` if you need details |
+| Record task or blocker progress | One typed checkpoint patch with `save --acquire` |
+| Hand work to another agent | Save a new checkpoint if needed (`save --acquire`, or ordinary `save` to close a multi-step lease); the recipient reads without writing |
+| Continue in a fresh session | Read-only `status --brief` or go straight to `status` / `handoff` for the next step and blockers |
+| Hold the Relay lease across steps | `resume` → `update` with progress → ordinary `save` to release the lease |
 | Upgrade an existing relay | Back up `.relay/` → `migrate --to-latest` dry run → review steps and source hash → explicit apply |
 | Convert a v1 relay document | `migrate --to-latest` (or `migrate`) → review `mapping_review_required` before cutover |
 | Read archived history | `archive` to list, `archive --id <record-id>` for one record verbatim |

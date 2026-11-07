@@ -69,18 +69,18 @@ Project Continuity 把这些风险变成明确的协议校验，同时保持状�
 
 ```mermaid
 flowchart LR
-    A[Agent A] -->|status + resume| C[.relay/CURRENT.md]
-    C -->|取得 lease| W[工作并验证]
-    W -->|里程碑 update| C
-    W -->|save 并释放 lease| H[交接]
-    H -->|status + resume| B[Agent B]
-    B --> C
+    A[Agent A] -->|status --brief| C[.relay/CURRENT.md]
+    C -->|只读上下文| W[工作并验证]
+    W -->|检查点执行 save --acquire| C
+    W -->|共享已记录的状态| H[交接]
+    H -->|只读续接| B[Agent B]
+    B -->|status --brief| C
 ```
 
-1. **检查**：`status --brief` 与 `validate` 完全只读，不会隐式初始化项目。
-2. **接棒**：Agent 核对 Git 漂移，并使用实际 revision 取得 writer lease。
-3. **更新**：按稳定 ID 提交结构化变更，revision 增加但 lease 保留。
-4. **保存**：先归档旧 revision，再原子提交新状态并释放 lease。容量治理在同一锁内完成后才替换当前文件。
+1. **检查**：默认先用只读的 `status --brief`，查看 `drift` 布尔值、`current_task`、未覆盖验收计数和最近最多三条证据的 ID 与结果。需要 `next_step`、阻塞列表或 Git 基线详情时，直接用完整的 `status` 或 `handoff`。`status` 和 `validate` 都不会隐式初始化项目。
+2. **工作并验证**：根据已记录的状态继续工作，不为开工而拿租约。只读续接零写入。
+3. **合并变更**：把同一业务事件的任务状态、证据、决策、阻塞和相关 `next_step` 合成一个检查点补丁。保留项目要求的独立检查点，遵守仅手动写入的覆盖规则。不逐条消息写入、不运行 watcher、不做 Git 提交或外部操作。
+4. **保存**：`save --acquire` 在写入事务内校验预期 revision 并复查 Git 漂移。如果他人持有有效租约，拒绝写入并指出持有者。保存成功时，在一个 revision 内取得租约、写入并释放：为旧状态创建快照，在同一锁内完成容量治理后再原子替换。
 5. **恢复**：只有 lease 已过期或存在受支持的历史修复场景，才允许显式 `recover`。
 
 ## 快速开始
@@ -91,12 +91,23 @@ flowchart LR
 # 只有显式 init 才会创建 .relay/
 python scripts/write_current.py init --root /path/to/project --name "My Project"
 
-# 只读检查
-python scripts/write_current.py status --root /path/to/project
+# 只读概览
+python scripts/write_current.py status --brief --root /path/to/project
+
+# 可选的只读结构检查
 python scripts/write_current.py validate --root /path/to/project
 ```
 
-读取当前 revision，然后取得 lease 并提交结构化变更：
+使用刚读到的 revision（此处 `init` 后为 0），用一个结构化补丁保存独立检查点：
+
+```bash
+python scripts/write_current.py save --acquire --root /path/to/project \
+  --writer agent-a --expected-revision 0 --input examples/change.json
+```
+
+开局无漂移不代表后续编辑不会引起漂移。如果保存时报告漂移，请检查记录的和当前观测到的 Git 基线，并审查差异。审查后只能由人决定是否使用 `--allow-drift`；Agent 不得自动加上该参数。
+
+只有需要跨步骤持有 Relay 写权时，才用 `resume` → `update` → 普通 `save`。租约协调的是 Relay 写入，不锁定工作区。不要只为拿租约而执行 `resume`，也不要把它作为 `save --acquire` 的前置操作。默认租期为 30 分钟。以下是另一种用法，从新 relay 的 revision 0 开始：
 
 ```bash
 python scripts/write_current.py resume --root /path/to/project \
@@ -106,18 +117,23 @@ python scripts/write_current.py update --root /path/to/project \
   --writer agent-a --expected-revision 1 --operation-id update-001 \
   --input examples/change.json
 
+# 记录下一步并释放租约，同时保持项目为 active
 python scripts/write_current.py save --root /path/to/project \
-  --writer agent-a --expected-revision 2 --operation-id save-001
+  --writer agent-a --expected-revision 2 --operation-id save-001 --input - <<'JSON'
+{"project":{"status":"active","next_step":"Add an empty-input regression case"}}
+JSON
 ```
 
-每次成功写入都会增加 revision。下一次写入前重新读取 `status`。同一个 operation ID 只能在输入完全相同时安全重试。默认 lease 为 30 分钟；只有审查过报告的 Git 漂移后才能使用 `--allow-drift`。
+与 `update` 不同，两种 `save` 都会释放租约；如果补丁未显式设置 `project.status`，还会把 `active` 项目改为 `paused`。
 
-容量会自动治理。新项目从 v6 开始，文档上限 32 KiB。达到上限的 80% 时，旧回执按每批至少 16 条无损写入 `.relay/receipts/`（当前文件保留 16 条）。如果文档仍高于这条线，已完成的任务、已解决的阻塞，以及只与它们相关的证据和决策会移入 `.relay/objects/` 下的无损冷归档；用 `archive --id <记录 ID>` 可以原样取回。回执压缩可以先预览或显式执行：
+在同一连续上下文中，复用返回的 `revision` 和 `lease_until`。遇到回放时，使用 `current_revision` 和返回的当前 `writer`、`lease_until`，不用回执里的历史 revision。重试同一个 operation ID 时，参数和输入必须完全相同。发生冲突后先读当前状态，确认补丁仍然成立，而不是只换掉预期 revision。
+
+容量会自动治理。新项目从 v6 开始，文档上限 32 KiB。达到上限的 80% 时，旧回执按每批至少 16 条无损写入 `.relay/receipts/`（当前文件保留 16 条）。如果文档仍高于这条线，已完成的任务、已解决的阻塞，以及只与它们相关的证据和决策会移入 `.relay/objects/` 下的无损冷归档；用 `archive --id <记录 ID>` 可以原样取回。回执压缩可以先预览；显式执行时需持有有效租约，并使用当前 revision：
 
 ```bash
 python scripts/write_current.py compact --root /path/to/project
 python scripts/write_current.py compact --apply --root /path/to/project \
-  --writer agent-a --expected-revision 3 --operation-id compact-001
+  --writer agent-a --expected-revision <n> --operation-id compact-001
 ```
 
 不带 `--apply` 的 `compact` 完全只读。`resume`、`update` 和 `save` 支持单次 `--no-auto-compact`，但不会绕过硬上限。history 快照和不再被引用的对象不会被自动删除：`gc` 报告可以释放多少空间，`gc --apply`（需持有 lease）删除最新 50 个以外的快照，以及任何保留版本都不再引用的对象。
@@ -137,10 +153,11 @@ python scripts/write_current.py verify --bundle /tmp/project-continuity-handoff.
 | 场景 | 推荐流程 |
 | --- | --- |
 | 新项目启用接力 | 显式 `init`，然后检查生成的状态 |
-| 开始或恢复任务 | `status` → 核对 Git 漂移 → `resume` |
-| 记录任务或阻塞变化 | 使用稳定 ID 执行结构化 `update` |
-| 交给另一个 Agent | 用 `save` 记录已验证状态并释放 lease |
-| 新会话继续 | `status` → 读取下一步和阻塞 → `resume` |
+| 开始或恢复任务 | `status --brief`；需要详情时直接用完整 `status` 或 `handoff` |
+| 记录任务或阻塞变化 | 用 `save --acquire` 写入一个结构化检查点补丁 |
+| 交给另一个 Agent | 需要时才保存新检查点（`save --acquire`，或用普通 `save` 结束跨步骤租约）；接棒方只读 |
+| 新会话继续 | 只读 `status --brief`；需要下一步和阻塞时直接用 `status` 或 `handoff` |
+| 跨步骤持有 Relay 租约 | `resume` → 用 `update` 记录进展 → 普通 `save` 释放租约 |
 | 升级已有 relay | 备份 `.relay/` → `migrate --to-latest` dry-run → 审查步骤和源哈希 → 显式 apply |
 | 转换 v1 relay | `migrate --to-latest`（或 `migrate`）→ 切换前复核 `mapping_review_required` |
 | 查看归档历史 | `archive` 列表，`archive --id <记录 ID>` 原样取回单条 |

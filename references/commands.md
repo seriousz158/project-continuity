@@ -8,11 +8,17 @@ revision numbers with values you have actually read.
 # inline format.
 python scripts/write_current.py init --root <project>
 
-# Read-only; neither command initializes state
-python scripts/write_current.py status --root <project>
+# Read-only; neither command initializes state. For next_step, blockers or Git
+# baseline details, go straight to full status or handoff instead of brief.
+python scripts/write_current.py status --brief --root <project>
 python scripts/write_current.py validate --root <project>
 
-# Acquire a 30-minute lease after reviewing status and Git drift
+# Standalone checkpoint (default): acquire, apply the patch and release in one revision
+python scripts/write_current.py save --acquire --root <project> \
+  --writer <writer-id> --expected-revision <n> --input change.json
+
+# Alternative only for work that needs to hold the Relay lease across steps:
+# review status and Git drift, then acquire a 30-minute lease.
 python scripts/write_current.py resume --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id>
 
@@ -21,7 +27,7 @@ python scripts/write_current.py update --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id> \
   --input change.json
 
-# Apply changes, archive the prior state, and release the lease
+# Finish multi-step work with a final patch and release the lease
 python scripts/write_current.py save --root <project> \
   --writer <writer-id> --expected-revision <n> --operation-id <unique-id> \
   --input - < change.json
@@ -120,9 +126,19 @@ python scripts/write_current.py verify --root <project> \
   --bundle /path/to/project-continuity-handoff.zip
 ```
 
+The lease coordinates Relay writes, not access to the working tree. Do not
+`resume` before a standalone `save --acquire`. The latter refuses a live
+foreign lease by naming its holder and checks Git drift during the write;
+work after a clean initial read can still cause drift. Use `--allow-drift`
+only with human approval after reviewing the reported drift; never add it
+automatically.
+
+Unlike `update`, either form of `save` releases the lease and changes an
+`active` project to `paused` unless the patch sets `project.status`.
+
 Add `--lease-minutes <positive-integer>` when the default 30 minutes is not
-appropriate. Add `--allow-drift` only after reviewing reported Git drift. For
-snapshot recovery, add `--snapshot <history-filename>`; never pass a path.
+appropriate. For snapshot recovery, add `--snapshot <history-filename>`;
+never pass a path.
 Writes automatically archive older operation receipts when the candidate file
 is at or above 80% of its limit (64 KiB for v3, 32 KiB from v4), keeping the
 newest 32 receipts in `CURRENT.md` (16 on v6). Receipts move in batches of at
@@ -132,9 +148,12 @@ Use `--no-auto-compact` on `resume`, `update`, or `save` for a single write when
 you need the pre-v3 fail-closed behavior. It never truncates project data; a
 candidate that still exceeds 64 KiB is rejected.
 
-Every new mutating operation advances the revision; replay does not. Reuse the
-returned revision (current_revision on replay) for the next mutation. Do not
-reuse an explicit operation ID for different input.
+Every new mutating operation advances the revision; replay does not. Within
+the same continuous context, reuse the returned `revision` and `lease_until`.
+On replay, use `current_revision` and the returned current `writer` and
+`lease_until`. Retry an operation ID only with identical arguments and input.
+On conflict, read the current state and check the patch still applies before
+retrying; do not just replace the expected revision.
 Input files whose path or ancestors are symbolic links are rejected; use
 reviewed standard input when a trusted regular file path is unavailable.
 
